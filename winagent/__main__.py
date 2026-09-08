@@ -61,7 +61,12 @@ def _cli_loop(config: Config, backend_kind: str, task: str | None, max_turns: in
         confirm=confirm,
     )
     agent = None
-    backend = create_backend(backend_kind, on_emergency_stop=lambda: agent and agent.stop())
+    try:
+        backend = create_backend(backend_kind, stop_hotkey=config.stop_hotkey,
+                                 on_emergency_stop=lambda: agent and agent.stop())
+    except Exception as exc:
+        print(f"Desktop backend error: {exc}", file=sys.stderr)
+        return 4
     agent = Agent(config, backend, events=events)
     print(f"{__app_name__} v{__version__} – model {config.model} @ {config.api_base_url} – backend {backend.name}")
     if task:
@@ -99,7 +104,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--api-key", help="override API key")
     parser.add_argument("--api-base-url", help="override API base URL (OpenAI compatible)")
     parser.add_argument("--model", help="override model name")
-    parser.add_argument("--backend", choices=["auto", "windows", "fake"], help="desktop backend")
+    parser.add_argument("--backend", choices=["auto", "windows", "fake"],
+                        help="auto/windows: real desktop (Windows only); fake: simulated demo, not your screen")
     parser.add_argument("--cli", action="store_true", help="interactive terminal mode instead of the GUI")
     parser.add_argument("--task", help="run one task headless and exit")
     parser.add_argument("--demo", action="store_true", help="GUI with the simulated desktop (safe on any OS)")

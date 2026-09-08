@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from typing import Callable, Optional
 
@@ -13,16 +14,23 @@ def create_backend(kind: str = "auto", *, stop_hotkey: Optional[str] = "ctrl+alt
                    on_emergency_stop: Optional[Callable[[], None]] = None) -> DesktopBackend:
     """Instantiate the desktop backend.
 
-    ``auto`` picks the real Windows backend on Windows and the simulated one
-    elsewhere (so the GUI can still be explored on other operating systems).
+    ``auto`` always means a real desktop, currently supported only on Windows.
+    Simulation must be requested explicitly (``fake`` / ``--demo``); it is
+    never a fallback for an unsupported platform or a failed Windows backend.
     """
-    kind = (kind or "auto").lower()
+    kind = (kind or "auto").strip().lower()
     if kind == "auto":
-        kind = "windows" if sys.platform == "win32" else "fake"
+        if sys.platform != "win32":
+            raise BackendError("Real desktop capture/control is supported only on Windows. "
+                               "Run WinAgent with Windows Python (not WSL, Docker or a remote Linux server). "
+                               "For a simulated demo only, use --demo or --backend fake; it cannot capture your screen.")
+        kind = "windows"
     if kind == "windows":
         from .windows import WindowsBackend
 
         return WindowsBackend(stop_hotkey=stop_hotkey or "", on_emergency_stop=on_emergency_stop)
     if kind == "fake":
+        logging.getLogger(__name__).warning("DEMO backend: screenshots and desktop actions are simulated, not your real screen. "
+                                            "Use --backend windows on Windows for real capture/control.")
         return FakeBackend()
     raise ValueError(f"Unknown backend {kind!r} (expected auto, windows or fake)")

@@ -148,6 +148,11 @@ class FakeBackend(DesktopBackend):
         # mouse cursor
         mx, my = self.mouse
         draw.polygon([(mx, my), (mx, my + 18), (mx + 5, my + 14), (mx + 12, my + 12)], fill=(0, 0, 0), outline=(255, 255, 255))
+        # Mark even saved/raw demo images so the blue background cannot be mistaken for a failed real capture.
+        draw.rectangle([0, 0, self.width, 56], fill=(45, 35, 25))
+        draw.text((12, 6), "DEMO - SIMULATED DESKTOP", fill=(255, 190, 90), font=self._font)
+        draw.text((12, 32), "Not your screen. Select the Windows backend for real screenshots.",
+                  fill=(255, 255, 255), font=self._font_small)
         if region:
             img = img.crop(region)
         return img

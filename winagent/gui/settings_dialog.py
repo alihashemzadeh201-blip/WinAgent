@@ -228,8 +228,13 @@ class SettingsDialog(QDialog):
         fform.addRow("", self.mouse_failsafe)
         self.backend = QComboBox()
         self.backend.addItems(BACKENDS)
-        self.backend.setToolTip("auto: real Windows desktop on Windows, simulated elsewhere.\nfake: simulated desktop for testing.")
+        self.backend.setToolTip("auto / windows: real desktop capture and control (Windows only).\n"
+                                "fake: explicit demo; images and desktop actions are simulated, not your real screen.")
         fform.addRow("Desktop backend", self.backend)
+        backend_note = QLabel("برای اسکرین‌شات واقعی روی ویندوز، windows یا auto را انتخاب کنید.\n"
+                              "fake فقط حالت آزمایشی است و تصویر واقعی صفحهٔ شما را نمی‌گیرد.")
+        backend_note.setWordWrap(True)
+        fform.addRow("", backend_note)
         self.log_level = QComboBox()
         self.log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
         fform.addRow("Log level", self.log_level)

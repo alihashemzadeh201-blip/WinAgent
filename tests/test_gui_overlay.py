@@ -5,8 +5,10 @@ Skipped automatically when PySide6 or an offscreen Qt platform is not available.
 
 import os
 import time
+from unittest.mock import Mock
 
 import pytest
+from PIL import Image
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -19,7 +21,9 @@ except Exception as exc:  # pragma: no cover
     pytest.skip(f"Qt cannot start here: {exc}", allow_module_level=True)
 
 from tests.mock_server import start_server  # noqa: E402
-from winagent.config import Config  # noqa: E402
+from winagent.backends import BackendError, FakeBackend  # noqa: E402
+from winagent.config import Config, load_config  # noqa: E402
+from winagent.gui import main_window as main_window_module  # noqa: E402
 from winagent.gui.main_window import MainWindow  # noqa: E402
 from winagent.gui.overlay import QtScreenGuard, StatusOverlay, physical_frame_rect  # noqa: E402
 from winagent.gui.settings_dialog import GUI_MODE_LABELS, SettingsDialog  # noqa: E402
@@ -195,3 +199,161 @@ def test_settings_dialog_round_trips_gui_mode(server):
     out = dlg._collect()
     assert out is not None and out.gui_mode_while_running == "minimize"
     assert out.validate() == []
+
+
+# ---------------------------------------------------------------- capture source / backend recovery
+@pytest.fixture
+def demo_window(tmp_path):
+    win = make_window("http://localhost/v1")
+    win.config_path = tmp_path / "config.json"
+    yield win
+    win.close()
+
+
+def accept_settings(monkeypatch, *, expected_backend, backend=None, model=None, hotkey=None):
+    """Exercise the real SettingsDialog collection/save path without a modal event loop."""
+    def accept(dlg):
+        assert dlg.backend.currentText() == expected_backend
+        if backend is not None:
+            dlg.backend.setCurrentText(backend)
+        if model is not None:
+            dlg.model.setCurrentText(model)
+        if hotkey is not None:
+            dlg.stop_hotkey.setText(hotkey)
+        dlg._accept()
+        assert dlg.result() == QDialog.DialogCode.Accepted
+        return dlg.result()
+
+    monkeypatch.setattr(SettingsDialog, "exec", accept)
+
+
+def test_demo_source_stays_visible_after_new_chat_and_status_updates(demo_window):
+    win = demo_window
+    win.manual_screenshot()
+    assert win._last_shot is not None and win.btn_open_shot.isEnabled()
+    win.new_chat()
+    win._on_status("Ready")
+    assert win.backend_label.isVisible()
+    assert "DEMO" in win.backend_label.text() and "not your screen" in win.backend_label.text()
+    assert "DEMO" in win.windowTitle()
+
+
+@pytest.mark.parametrize("selected", ["auto", "windows"])
+def test_settings_can_leave_launch_demo_and_clear_simulated_context(demo_window, monkeypatch, selected):
+    win = demo_window
+    win.manual_screenshot()
+    win.agent.history.append({"role": "user", "content": "old simulated desktop"})
+    old = win.backend
+    old.close = Mock()
+    # Stand-in for a Windows desktop result, with odd RGB row width to exercise the Qt image conversion too.
+    real = FakeBackend(width=401, height=201)
+    real.name = "windows"
+    raw = Image.new("RGB", (401, 201), (17, 153, 61))
+    raw.putpixel((1, 2), (200, 40, 50))
+    real.capture = Mock(return_value=raw)
+    factory = Mock(return_value=real)
+    monkeypatch.setattr(main_window_module, "create_backend", factory)
+    accept_settings(monkeypatch, expected_backend="fake", backend=selected)
+
+    win.open_settings()
+    assert win.backend_override is None
+    assert win.backend is real and win.agent.backend is real
+    assert win.config.backend == selected and load_config(win.config_path, env=False).backend == selected
+    old.close.assert_called_once()
+    factory.assert_called_once_with(selected, stop_hotkey=win.config.stop_hotkey, on_emergency_stop=win._emergency_stop)
+    assert win.agent.history == [] and win.agent.executor.last_screenshot is None
+    assert win._last_shot is None and win.shot_view.pixmap_full() is None
+    assert not win.btn_open_shot.isEnabled() and win.shot_label.text() == ""
+    assert "real desktop" in win.backend_label.text() and "DEMO" not in win.windowTitle()
+
+    win.manual_screenshot()
+    real.capture.assert_called_once()
+    assert win.shot_view.pixmap_full().toImage().pixelColor(1, 2).getRgb() == (200, 40, 50, 255)
+    assert win.btn_open_shot.isEnabled()
+
+
+@pytest.mark.parametrize("change_hotkey", [False, True])
+def test_saving_other_settings_does_not_persist_temporary_demo(demo_window, monkeypatch, change_hotkey):
+    win = demo_window
+    old = win.backend
+    factory = Mock(return_value=FakeBackend())
+    monkeypatch.setattr(main_window_module, "create_backend", factory)
+    hotkey = "ctrl+shift+esc" if change_hotkey else None
+    accept_settings(monkeypatch, expected_backend="fake", model="new-model", hotkey=hotkey)
+
+    win.open_settings()
+    assert win.backend_override == "fake"
+    assert win.config.backend == "auto"
+    assert load_config(win.config_path, env=False).backend == "auto"
+    assert win.config.model == "new-model"
+    if change_hotkey:
+        factory.assert_called_once_with("fake", stop_hotkey=hotkey, on_emergency_stop=win._emergency_stop)
+    else:
+        factory.assert_not_called()
+        assert win.backend is old
+
+
+@pytest.mark.parametrize("kind", ["auto", "windows"])
+def test_backend_init_failure_disables_actions_without_fake_fallback(monkeypatch, kind):
+    factory = Mock(side_effect=BackendError("Win32 initialisation failed"))
+    monkeypatch.setattr(main_window_module, "create_backend", factory)
+    critical, warning = Mock(), Mock()
+    monkeypatch.setattr(main_window_module.QMessageBox, "critical", critical)
+    monkeypatch.setattr(main_window_module.QMessageBox, "warning", warning)
+    win = MainWindow(Config(backend=kind, api_base_url="http://localhost/v1"))
+    try:
+        assert factory.call_count == 1 and factory.call_args.args[0] == kind
+        assert win.backend is None and win.agent is None
+        assert not win.btn_screenshot.isEnabled() and not win.btn_send.isEnabled()
+        assert not win.btn_open_shot.isEnabled() and win.btn_settings.isEnabled()
+        assert win.shot_view.pixmap_full() is None and not win.guard.enabled
+        assert "unavailable" in win.backend_label.text()
+        assert "Win32 initialisation failed" in critical.call_args.args[2]
+        win.input.submitted.emit("take a screenshot")  # Enter must be blocked, not just the Send button.
+        assert win.worker is None and warning.call_count == 1
+    finally:
+        win.close()
+
+
+def test_failed_settings_switch_can_retry_same_backend(demo_window, monkeypatch):
+    win = demo_window
+    win.manual_screenshot()
+    real = FakeBackend()
+    real.name = "windows"
+    factory = Mock(side_effect=[BackendError("Windows unavailable"), real])
+    monkeypatch.setattr(main_window_module, "create_backend", factory)
+    monkeypatch.setattr(main_window_module.QMessageBox, "critical", Mock())
+    accept_settings(monkeypatch, expected_backend="fake", backend="windows")
+    win.open_settings()
+    assert win.backend is None and win.agent is None
+    assert win.shot_view.pixmap_full() is None and not win.btn_open_shot.isEnabled()
+    assert not win.btn_send.isEnabled() and not win.btn_screenshot.isEnabled()
+    assert win.windows_tree.topLevelItemCount() == 0
+
+    accept_settings(monkeypatch, expected_backend="windows")
+    win.open_settings()
+    assert [call.args[0] for call in factory.call_args_list] == ["windows", "windows"]
+    assert win.backend is real and win.agent is not None
+    assert win.btn_send.isEnabled() and win.btn_screenshot.isEnabled()
+    assert "real desktop" in win.backend_label.text()
+
+
+def test_failed_manual_capture_clears_stale_preview(demo_window, monkeypatch):
+    win = demo_window
+    win.manual_screenshot()
+    assert win.shot_view.pixmap_full() is not None
+    monkeypatch.setattr(win.backend, "capture", Mock(side_effect=BackendError("screen grab failed")))
+    warning = Mock()
+    monkeypatch.setattr(main_window_module.QMessageBox, "warning", warning)
+    win.manual_screenshot()
+    assert win._last_shot is None and win.shot_view.pixmap_full() is None
+    assert not win.btn_open_shot.isEnabled()
+    assert "screen grab failed" in warning.call_args.args[2]
+    assert "screen grab failed" in win.chat.transcript()
+
+
+def test_manual_screenshot_button_disabled_while_worker_uses_frame(demo_window):
+    demo_window._set_running(True)
+    assert not demo_window.btn_screenshot.isEnabled()
+    demo_window._set_running(False)
+    assert demo_window.btn_screenshot.isEnabled()

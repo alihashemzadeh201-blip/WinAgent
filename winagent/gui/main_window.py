@@ -205,9 +205,15 @@ class MainWindow(QMainWindow):
         head.addWidget(self.shot_label, 1)
         self.btn_open_shot = QPushButton("Open")
         self.btn_open_shot.setObjectName("Flat")
+        self.btn_open_shot.setEnabled(False)
         self.btn_open_shot.clicked.connect(self.open_screenshot_window)
         head.addWidget(self.btn_open_shot)
         sv.addLayout(head)
+        # Persistent source label: task/status updates and New chat must not hide demo mode.
+        self.backend_label = QLabel()
+        self.backend_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.backend_label.setWordWrap(True)
+        sv.addWidget(self.backend_label)
         self.shot_view = ScreenshotView()
         self.shot_view.clicked.connect(self.open_screenshot_window)
         sv.addWidget(self.shot_view, 1)
@@ -287,16 +293,34 @@ class MainWindow(QMainWindow):
     # ============================================================= backend
     def _init_backend(self) -> None:
         kind = self.backend_override or self.config.backend
+        if self.backend is not None:
+            try:
+                self.backend.close()
+            except Exception:
+                log.exception("backend close failed")
+        # A new desktop must not inherit the old one's images, window handles or action history.
+        self.backend = None
+        self.agent = None
+        self._clear_screenshot()
         try:
             self.backend = create_backend(kind, stop_hotkey=self.config.stop_hotkey, on_emergency_stop=self._emergency_stop)
         except Exception as exc:
-            log.exception("backend init failed")
-            QMessageBox.critical(self, "Backend error", f"Could not initialise the desktop backend:\n{exc}\n\nFalling back to the simulated backend.")
-            self.backend = create_backend("fake")
+            log.exception("backend init failed (requested: %s)", kind)
+            self._rebuild_agent()
+            self._clear_screenshot("دسترسی به دسکتاپ برقرار نیست؛ تنظیمات بک‌اند را بررسی کنید.")
+            message = (f"Could not initialise desktop backend '{kind}':\n{exc}\n\n"
+                       "No simulated fallback was used. Open Settings → Safety → Desktop backend "
+                       "to choose windows for a real Windows desktop, or fake for an explicit demo.")
+            self.backend_label.setToolTip(str(exc))
+            self.status_label.setText("Desktop unavailable — check Settings")
+            self.chat.add("error", message)
+            QMessageBox.critical(self, "Backend error", message)
+            return
         self._rebuild_agent()
+        log.info("Desktop backend: %s (requested: %s)", self.backend.name, kind)
         if self.backend.name == "fake":
-            self.chat.add("system", "⚠ Simulated desktop backend is active (not running on Windows, or 'fake' selected in settings). "
-                                    "Actions are simulated and do not affect a real machine.")
+            self.chat.add("system", "⚠ DEMO: تصویر آبی، دسکتاپ شبیه‌سازی‌شده است، نه اسکرین‌شات صفحهٔ شما. "
+                                    "برای تصویر واقعی روی ویندوز، در Settings → Safety → Desktop backend گزینهٔ windows را انتخاب کنید.")
         elif getattr(self.backend, "hotkey_registered", True) is False:
             self.chat.add("system", f"⚠ The emergency-stop hotkey '{self.config.stop_hotkey}' could not be registered "
                                     "(already used by another program). Use the Stop button or the mouse fail-safe instead.")
@@ -316,10 +340,38 @@ class MainWindow(QMainWindow):
             confirm=self._confirm_blocking,
         )
         history = self.agent.history if self.agent else []
-        self.guard.enabled = self.gui_mode != "none"   # also covers the manual Screenshot button while idle
-        self.agent = Agent(self.config, self.backend, events=events, guard=self.guard)
-        self.agent.history = history
+        self.guard.enabled = self.backend is not None and self.gui_mode != "none"
+        self.agent = Agent(self.config, self.backend, events=events, guard=self.guard) if self.backend is not None else None
+        if self.agent is not None:
+            self.agent.history = history
         self.model_label.setText(f"·  {self.config.model}  @  {self.config.api_base_url}")
+        self._update_backend_label()
+        self._set_running(False)
+
+    def _update_backend_label(self) -> None:
+        title = f"{__app_name__} v{__version__}"
+        if self.backend is None:
+            text = "Desktop unavailable — Settings → Safety → Desktop backend"
+            color = PALETTE["error"]
+            title += " — Desktop unavailable"
+        elif self.backend.name == "fake":
+            text = ("DEMO · fake — simulated desktop, not your screen.\n"
+                    "برای اسکرین‌شات واقعی روی ویندوز: Settings → Safety → Desktop backend → windows")
+            color = PALETTE["warn"]
+            title += " — DEMO"
+        else:
+            text = f"Capture source: {self.backend.name} · real desktop"
+            color = PALETTE["success"]
+        self.backend_label.setText(text)
+        self.backend_label.setToolTip(text)
+        self.backend_label.setStyleSheet(f"color: {color}; padding: 4px;")
+        self.setWindowTitle(title)
+
+    def _clear_screenshot(self, text: str = "هنوز اسکرین‌شاتی گرفته نشده است") -> None:
+        self._last_shot = None
+        self.shot_view.clear_image(text)
+        self.shot_label.clear()
+        self.btn_open_shot.setEnabled(False)
 
     def _emergency_stop(self) -> None:
         """Called from the hot-key thread."""
@@ -349,6 +401,9 @@ class MainWindow(QMainWindow):
             return
         if self.is_running():
             QMessageBox.information(self, "Busy", "The agent is still working. Press Stop to interrupt it.")
+            return
+        if self.agent is None:
+            QMessageBox.warning(self, "Desktop unavailable", "Choose a working desktop backend in Settings → Safety first.")
             return
         problems = self.config.validate()
         if problems:
@@ -394,7 +449,9 @@ class MainWindow(QMainWindow):
         self.chat.add("assistant", WELCOME)
 
     def _set_running(self, running: bool) -> None:
-        self.btn_send.setEnabled(not running)
+        self.btn_send.setEnabled(not running and self.agent is not None)
+        # Do not race a manual capture against the worker's screenshot coordinate frame / screen guard.
+        self.btn_screenshot.setEnabled(not running and self.agent is not None)
         self.btn_stop.setEnabled(running)
         self.btn_new.setEnabled(True)
         self.btn_settings.setEnabled(not running)
@@ -513,6 +570,7 @@ class MainWindow(QMainWindow):
     def _on_screenshot(self, shot: Screenshot) -> None:
         self._last_shot = shot
         self.shot_view.set_image(shot.image)
+        self.btn_open_shot.setEnabled(True)
         w, h = shot.size
         self.shot_label.setText(f"{w}×{h}  (raw {shot.raw_size[0]}×{shot.raw_size[1]})  {time.strftime('%H:%M:%S', time.localtime(shot.taken_at))}")
 
@@ -612,11 +670,14 @@ class MainWindow(QMainWindow):
 
     # ============================================================= actions
     def manual_screenshot(self) -> None:
-        if not self.agent:
+        if not self.agent or self.is_running():
             return
         try:
             shot = self.agent.executor.take_screenshot()
         except Exception as exc:
+            log.exception("manual screenshot failed")
+            self._clear_screenshot("اسکرین‌شات ناموفق بود؛ خطای ثبت‌شده را بررسی کنید.")
+            self.chat.add("error", f"Screen capture failed: {exc}")
             QMessageBox.warning(self, "Screenshot", str(exc))
             return
         self._on_screenshot(shot)
@@ -661,11 +722,20 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         if self.is_running():
             return
-        dlg = SettingsDialog(self.config, self)
+        # Show the actual selection, including --demo / --backend, rather than an inactive config value.
+        settings_cfg = self.config.copy()
+        settings_cfg.backend = self.backend_override or self.config.backend
+        dlg = SettingsDialog(settings_cfg, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         new_cfg = dlg.result_config()
-        backend_changed = (new_cfg.backend != self.config.backend) or (new_cfg.stop_hotkey != self.config.stop_hotkey)
+        selection_changed = new_cfg.backend != settings_cfg.backend
+        backend_changed = selection_changed or new_cfg.stop_hotkey != self.config.stop_hotkey or self.backend is None
+        if selection_changed:
+            self.backend_override = None   # an explicit GUI choice supersedes the launch flag
+        elif self.backend_override:
+            # Saving an API key must not accidentally persist a temporary --demo session as backend=fake.
+            new_cfg.backend = self.config.backend
         self.config = new_cfg
         try:
             path = save_config(self.config, self.config_path)
@@ -674,21 +744,18 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.warning(self, "Settings", f"Could not save settings: {exc}")
         logging.getLogger().setLevel(self.config.log_level)
-        if backend_changed and not self.backend_override:
-            try:
-                if self.backend:
-                    self.backend.close()
-                self.backend = create_backend(self.config.backend, stop_hotkey=self.config.stop_hotkey, on_emergency_stop=self._emergency_stop)
-            except Exception as exc:
-                QMessageBox.critical(self, "Backend error", str(exc))
-                self.backend = create_backend("fake")
         self.overlay.configure(self.config.overlay_corner, self.config.overlay_exclude_from_capture)
-        self._rebuild_agent()
+        if backend_changed:
+            self._init_backend()
+        else:
+            self._rebuild_agent()
         self._refresh_info()
 
     # ================================================================ info
     def _refresh_info(self) -> None:
         if not self.backend:
+            self.info_label.set_pairs([("backend", "unavailable"), ("requested backend", self.backend_override or self.config.backend)])
+            self.windows_tree.clear()
             return
         try:
             info = self.backend.system_info()

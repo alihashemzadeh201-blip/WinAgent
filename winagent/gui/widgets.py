@@ -252,8 +252,14 @@ class ScreenshotView(QLabel):
         self.setMinimumSize(QSize(200, 120))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet(f"background: {PALETTE['panel2']}; border: 1px solid {PALETTE['border']}; border-radius: 8px; color: {PALETTE['muted']};")
-        self.setText("هنوز اسکرین‌شاتی گرفته نشده است")
+        self.clear_image()
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def clear_image(self, text: str = "هنوز اسکرین‌شاتی گرفته نشده است") -> None:
+        """Discard both the displayed image and its full-size copy (e.g. after changing backends)."""
+        self._pixmap = None
+        self.clear()
+        self.setText(text)
 
     def set_image(self, image) -> None:
         """Accept a PIL image."""

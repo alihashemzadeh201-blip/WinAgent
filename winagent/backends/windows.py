@@ -377,9 +377,14 @@ class WindowsBackend(DesktopBackend):
 
     def capture(self, all_screens: bool = False, region: Optional[tuple[int, int, int, int]] = None) -> Image.Image:
         try:
-            img = ImageGrab.grab(bbox=region, all_screens=all_screens)
+            # Include layered windows (CAPTUREBLT) so they do not disappear from the captured desktop.
+            # A region uses absolute desktop coordinates, including negative multi-monitor origins.
+            img = ImageGrab.grab(bbox=region, all_screens=all_screens or region is not None,
+                                 include_layered_windows=True)
         except Exception as exc:
-            raise BackendError(f"Screen capture failed: {exc}") from exc
+            raise BackendError(f"Screen capture failed: {exc}. "
+                               "Run WinAgent in an unlocked, interactive Windows desktop session "
+                               "(reconnect Remote Desktop if it was disconnected).") from exc
         if img.mode != "RGB":
             img = img.convert("RGB")
         return img

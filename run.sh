@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Development launcher for macOS/Linux (runs with the simulated desktop backend).
+# Launcher for a POSIX shell. On macOS/Linux, pass --demo explicitly to explore the simulated desktop.
 set -e
 cd "$(dirname "$0")"
 if [ ! -x ".venv/bin/python" ]; then
@@ -7,4 +7,4 @@ if [ ! -x ".venv/bin/python" ]; then
   .venv/bin/python -m pip install --upgrade pip >/dev/null
   .venv/bin/python -m pip install -r requirements.txt
 fi
-exec .venv/bin/python -m winagent --demo "$@"
+exec .venv/bin/python -m winagent "$@"
