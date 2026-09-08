@@ -1,0 +1,38 @@
+{
+  "api_base_url": "https://api.openai.com/v1",
+  "api_key": "sk-REPLACE_ME",
+  "model": "gpt-4o-mini",
+  "temperature": 0.2,
+  "max_tokens": 2048,
+  "request_timeout": 120.0,
+  "max_retries": 3,
+  "extra_headers": {},
+
+  "tool_protocol": "auto",
+  "max_steps": 40,
+  "vision_enabled": true,
+  "auto_screenshot_after_action": true,
+  "action_delay": 0.6,
+  "max_images_in_context": 3,
+  "max_history_messages": 80,
+  "confirm_dangerous_actions": true,
+  "allow_shell_commands": true,
+  "allow_file_write": true,
+  "stop_hotkey": "ctrl+alt+esc",
+  "mouse_failsafe": true,
+  "response_language": "auto",
+  "extra_system_prompt": "",
+
+  "screenshot_max_width": 1280,
+  "screenshot_grid": true,
+  "screenshot_grid_spacing": 100,
+  "screenshot_show_cursor": true,
+  "screenshot_format": "jpeg",
+  "screenshot_jpeg_quality": 70,
+
+  "backend": "auto",
+  "gui_mode_while_running": "overlay",
+  "overlay_corner": "bottom-right",
+  "overlay_exclude_from_capture": true,
+  "log_level": "INFO"
+}

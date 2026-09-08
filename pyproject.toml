@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "winagent"
+version = "0.1.0"
+description = "LLM-powered computer-use agent for Windows with a chat GUI (OpenAI-compatible API, JSON tool protocol)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "WinAgent contributors" }]
+keywords = ["agent", "llm", "windows", "automation", "computer-use", "gui"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Desktop Environment",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "requests>=2.31",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.5"]
+dev = ["pytest>=7", "ruff>=0.4"]
+
+[project.scripts]
+winagent = "winagent.__main__:main"
+
+[project.gui-scripts]
+winagent-gui = "winagent.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["winagent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 130
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = ["E501", "E741", "B008"]
