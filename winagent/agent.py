@@ -19,16 +19,18 @@ from typing import Any, Callable, Optional
 
 from .backends.base import DesktopBackend, EmergencyStop
 from .config import Config
-from .llm import LLMCancelled, LLMClient, LLMError
+from .llm import LLMCancelled, LLMClient, LLMError, LLMResponseError
 from .prompts import build_system_prompt
 from .protocol import (
     AssistantTurn,
+    ProtocolError,
     ToolCall,
     assistant_message_json,
     assistant_message_native,
     image_part,
     parse_json_protocol,
     parse_native_response,
+    response_text,
     text_part,
     tool_result_message_native,
     tool_results_message_json,
@@ -194,7 +196,7 @@ class Agent:
 
                 if not turn.tool_calls:
                     # plain answer -> conversation turn is over
-                    reply = turn.text or "(empty response)"
+                    reply = turn.text  # _call_model has already rejected empty/malformed output
                     self._append(assistant_message_native(turn) if self.protocol == "native" else assistant_message_json(turn))
                     self.events.on_assistant_text(reply)
                     outcome = RunOutcome("answered", reply)
@@ -295,31 +297,60 @@ class Agent:
                 self._append(msg)
 
     def _call_model(self) -> AssistantTurn:
-        """Call the model with the current protocol, downgrading features on failure."""
-        for _attempt in range(4):
+        """Negotiate capabilities and recover bad output BEFORE committing any tool calls to history.
+
+        Transport retries live in LLMClient. Response retries have a separate, finite budget; the
+        repair prompt is request-local so invalid native calls never leave orphan tool messages.
+        Previously successful rounds are preserved and are never re-executed by this retry loop.
+        """
+        retries = 0
+        repair_reason = ""
+        while True:
             if self.stop_event.is_set():
                 raise LLMCancelled("stopped")
             messages = self._messages()
+            if repair_reason:
+                messages.append({"role": "user", "content": self._response_repair_prompt(repair_reason)})
             try:
-                if self.protocol == "native":
-                    resp = self.llm.chat(messages, tools=openai_tool_schemas())
+                resp = self.llm.chat(messages, tools=openai_tool_schemas()) if self.protocol == "native" else self.llm.chat(messages)
+                if self.stop_event.is_set():
+                    raise LLMCancelled("stopped")
+                if not isinstance(resp.message, dict):
+                    raise LLMResponseError("Assistant message must be an object.")
+                if resp.finish_reason == "content_filter":
+                    raise LLMError("The model response was blocked by the provider's content filter.")
+                if isinstance(resp.message.get("refusal"), str) and resp.message["refusal"].strip():
+                    return parse_native_response(resp.message)  # a genuine refusal is not a format fault
+                if resp.finish_reason in ("length", "max_tokens", "max_output_tokens"):
+                    raise LLMResponseError("The response was truncated by the output-token limit. Reply more concisely.")
+                if self.protocol == "native" or resp.message.get("tool_calls") or resp.message.get("function_call") is not None:
                     turn = parse_native_response(resp.message)
                 else:
-                    resp = self.llm.chat(messages, response_json=False)
-                    content = resp.message.get("content") or ""
-                    if isinstance(content, list):
-                        content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
-                    turn = parse_json_protocol(content)
-                    if resp.message.get("tool_calls"):  # server did tools anyway
-                        native = parse_native_response(resp.message)
-                        if native.tool_calls:
-                            turn = native
+                    turn = parse_json_protocol(response_text(resp.message.get("content")))
+                if turn.parse_error:
+                    raise LLMResponseError(turn.parse_error)
+                if resp.finish_reason in ("tool_calls", "function_call") and not turn.tool_calls:
+                    raise LLMResponseError("The response announces tool calls but contains none.")
+                if not turn.tool_calls and not turn.text.strip():
+                    raise LLMResponseError("The response has no actions or answer.")
                 turn.finish_reason = resp.finish_reason
                 turn.usage = resp.usage
                 return turn
+            except (LLMResponseError, ProtocolError) as exc:
+                if self.stop_event.is_set():
+                    raise LLMCancelled("stopped") from exc
+                if retries >= self.config.max_response_retries:
+                    raise LLMError(f"Model response is still invalid after {retries + 1} attempts: {exc} "
+                                   "No actions from the rejected response were executed. "
+                                   "Check the model/tool protocol or increase Max tokens for truncated output.") from exc
+                retries += 1
+                repair_reason = str(exc)
+                log.warning("Invalid model output; requesting correction (%d/%d).", retries, self.config.max_response_retries)
+                self.events.on_status(f"Invalid model response – requesting correction ({retries}/{self.config.max_response_retries}).")
             except LLMError as exc:
                 if isinstance(exc, LLMCancelled):
                     raise
+                # These are one-way state changes, separate from the response-repair budget.
                 if self.protocol == "native" and self.llm.supports_tools is False and self.config.tool_protocol in ("auto", "native"):
                     self.events.on_status("Model has no native tool calling – switching to JSON protocol.")
                     self._switch_to_json()
@@ -329,7 +360,22 @@ class Agent:
                     self._disable_vision()
                     continue
                 raise
-        raise LLMError("Could not negotiate a working protocol with the model.")
+
+    def _response_repair_prompt(self, reason: str) -> str:
+        protocol = (
+            'Return native tool_calls with complete JSON-object arguments for actions. '
+            'For a genuine answer requiring no actions, reply with normal text.'
+            if self.protocol == "native" else
+            'Return ONE complete JSON object, e.g. {"actions":[{"tool":"screenshot","args":{}}]} '
+            '(shape example only; choose the actual tools and required arguments for this task), '
+            'or {"message":"your actual answer"}. No prose outside JSON.'
+        )
+        return (f"Your previous response was invalid: {reason[:500]}\n"
+                "It was discarded; NO actions from that response were executed. Send a COMPLETE replacement, "
+                "not a continuation of the broken output. Continue the user's current task from the screenshot "
+                "and tool results already provided; do NOT repeat earlier successful actions. "
+                "Do not echo screenshot coordinate metadata or return only reasoning. Keep the response concise "
+                "and in the original user's language. " + protocol)
 
     def _switch_to_json(self) -> None:
         self.protocol = "json"

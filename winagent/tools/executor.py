@@ -134,6 +134,7 @@ class ToolExecutor:
             grid_spacing=cfg.screenshot_grid_spacing, cursor=cursor,
             fmt=cfg.screenshot_format, quality=cfg.screenshot_jpeg_quality,
         )
+        shot.is_region = phys_region is not None
         if phys_region is None:
             self.last_screenshot = shot  # regions don't replace the coordinate frame
         self.screenshot_count += 1
@@ -146,12 +147,13 @@ class ToolExecutor:
             # no screenshot yet: treat as physical coordinates
             return xi, yi
         w, h = self.last_screenshot.size
-        if not (-50 <= xi <= w + 50 and -50 <= yi <= h + 50):
+        if not (0 <= xi < w and 0 <= yi < h):
             raise BackendError(f"Coordinates ({xi},{yi}) are outside the screenshot ({w}x{h}). "
-                               "Use coordinates from the latest screenshot.")
-        xi = min(max(xi, 0), w - 1)
-        yi = min(max(yi, 0), h - 1)
-        return self.last_screenshot.to_physical(xi, yi)
+                               "Use coordinates from the last full screenshot.")
+        px, py = self.last_screenshot.to_physical(xi, yi)
+        log.debug("Pointer mapping: image=(%s,%s) image_size=%s raw_size=%s origin=%s -> physical=(%s,%s)",
+                  xi, yi, self.last_screenshot.size, self.last_screenshot.raw_size, self.last_screenshot.origin, px, py)
+        return px, py
 
     def _pointer(self) -> Optional[tuple[int, int]]:
         try:
@@ -174,7 +176,15 @@ class ToolExecutor:
                 x, y = self.backend.mouse_position()
             except Exception:
                 return
-            if x <= 0 and y <= 0:
+            # Negative coordinates are valid on monitors above/left of the primary, not a whole fail-safe quadrant.
+            at_corner = (x, y) == (0, 0)
+            if not at_corner and (x < 0 or y < 0):
+                try:
+                    virtual = self.backend.screen_geometry(all_screens=True)
+                    at_corner = (x, y) == (virtual.left, virtual.top)
+                except Exception:
+                    pass
+            if at_corner:
                 raise EmergencyStop("Fail-safe triggered: the mouse was moved to the top-left corner of the screen.")
 
     def _find_window(self, args: dict[str, Any]):
@@ -263,8 +273,9 @@ class ToolExecutor:
         except Exception:
             pass
         if region is not None:
-            data["note"] = ("This is a ZOOMED region; its coordinates are NOT the global frame. To click, convert back "
-                            f"using region origin ({region[0]},{region[1]}) and scale, or take a full screenshot.")
+            data["note"] = ("This is a ZOOMED detail for inspection, not a new click coordinate frame. "
+                            "Pointer actions still use the last full screenshot. Take screenshot without region "
+                            "before clicking an element found in this crop.")
             data["region"] = region
         return ToolResult(call, True, data, screenshot=shot)
 

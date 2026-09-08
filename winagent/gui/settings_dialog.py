@@ -143,6 +143,11 @@ class SettingsDialog(QDialog):
         self.max_steps = QSpinBox()
         self.max_steps.setRange(1, 500)
         aform.addRow("Max steps per task", self.max_steps)
+        self.response_retries = QSpinBox()
+        self.response_retries.setRange(0, 10)
+        self.response_retries.setToolTip("Additional requests when model output is malformed, empty or truncated. "
+                                        "Rejected responses execute no actions; successful actions are not repeated.")
+        aform.addRow("Malformed-response retries", self.response_retries)
         self.vision_enabled = QCheckBox("Send screenshots to the model (vision)")
         aform.addRow("", self.vision_enabled)
         self.auto_screenshot = QCheckBox("Automatically capture the screen after each action")
@@ -270,6 +275,7 @@ class SettingsDialog(QDialog):
         self.tool_protocol.setCurrentText(cfg.tool_protocol)
         self.extra_headers.setText(json.dumps(cfg.extra_headers, ensure_ascii=False) if cfg.extra_headers else "")
         self.max_steps.setValue(cfg.max_steps)
+        self.response_retries.setValue(cfg.max_response_retries)
         self.vision_enabled.setChecked(cfg.vision_enabled)
         self.auto_screenshot.setChecked(cfg.auto_screenshot_after_action)
         self.action_delay.setValue(cfg.action_delay)
@@ -325,6 +331,7 @@ class SettingsDialog(QDialog):
         else:
             cfg.extra_headers = {}
         cfg.max_steps = int(self.max_steps.value())
+        cfg.max_response_retries = int(self.response_retries.value())
         cfg.vision_enabled = self.vision_enabled.isChecked()
         cfg.auto_screenshot_after_action = self.auto_screenshot.isChecked()
         cfg.action_delay = float(self.action_delay.value())

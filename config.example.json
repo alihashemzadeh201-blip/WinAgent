@@ -10,6 +10,7 @@
 
   "tool_protocol": "auto",
   "max_steps": 40,
+  "max_response_retries": 3,
   "vision_enabled": true,
   "auto_screenshot_after_action": true,
   "action_delay": 0.6,

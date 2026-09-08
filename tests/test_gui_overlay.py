@@ -29,6 +29,19 @@ from winagent.gui.overlay import QtScreenGuard, StatusOverlay, physical_frame_re
 from winagent.gui.settings_dialog import GUI_MODE_LABELS, SettingsDialog  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def dispose_test_windows():
+    """Dispose native widgets on the Qt thread, not during Python's unordered interpreter shutdown."""
+    yield
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    for widget in _app.topLevelWidgets():
+        widget.close()
+        widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    _app.processEvents()
+
+
 def pump(seconds: float = 0.05) -> None:
     end = time.time() + seconds
     while time.time() < end:
@@ -357,3 +370,53 @@ def test_manual_screenshot_button_disabled_while_worker_uses_frame(demo_window):
     assert not demo_window.btn_screenshot.isEnabled()
     demo_window._set_running(False)
     assert demo_window.btn_screenshot.isEnabled()
+
+
+def test_response_retry_setting_round_trips():
+    dlg = SettingsDialog(Config(max_response_retries=0))
+    assert dlg.response_retries.value() == 0
+    dlg.response_retries.setValue(5)
+    cfg = dlg._collect()
+    assert cfg is not None and cfg.max_response_retries == 5
+    assert not cfg.validate()
+    dlg.close()
+
+
+def test_gui_sets_process_dpi_awareness_before_creating_qt_app(monkeypatch):
+    from winagent.backends import windows
+
+    order = []
+    app = Mock()
+    app.exec.return_value = 0
+    factory = Mock(side_effect=lambda *args: order.append("qt") or app)
+    factory.instance.return_value = None
+    monkeypatch.setattr(main_window_module, "QApplication", factory)
+    monkeypatch.setattr(main_window_module, "MainWindow", Mock())
+    monkeypatch.setattr(windows, "make_dpi_aware", lambda: order.append("dpi"))
+    assert main_window_module.run_gui(Config(), backend_override="fake") == 0
+    assert order == ["dpi", "qt"]
+
+
+def test_gui_keeps_working_after_bad_model_response(server, monkeypatch):
+    from tests import mock_server
+
+    original_plan = mock_server.plan
+    requests = []
+    broken = "document, y from 0 (top) to 719 (bottom).]"
+    def flaky_plan(messages):
+        requests.append(messages)
+        if len(requests) == 1:
+            return broken, []
+        return original_plan(messages)
+    monkeypatch.setattr(mock_server, "plan", flaky_plan)
+    win = make_window(server)
+    try:
+        run_task(win, "open notepad and write hello")
+        assert "completed" in win.status_label.text().lower()
+        assert broken not in win.chat.transcript()
+        assert not win.btn_stop.isEnabled()
+        assert sum(e["kind"] == "open_app" for e in win.backend.events) == 1
+        assert sum(e["kind"] == "type" for e in win.backend.events) == 1
+        assert "NO actions" in requests[1][-1]["content"]
+    finally:
+        win.close()

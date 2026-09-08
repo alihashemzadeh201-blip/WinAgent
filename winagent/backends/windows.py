@@ -1,7 +1,7 @@
 """Real Windows desktop backend (Win32 API through ``ctypes``).
 
 Everything here is deliberately dependency-light: mouse/keyboard input goes
-through ``SendInput``/``SetCursorPos``, screenshots through Pillow's
+through ``SendInput``/``SetPhysicalCursorPos``, screenshots through Pillow's
 ``ImageGrab`` (which uses ``BitBlt``), windows through ``EnumWindows`` and
 friends, the clipboard through the user32 clipboard API.  No pywin32 /
 pyautogui required.
@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from ctypes import wintypes
 from typing import Any, Callable, Optional
 
@@ -187,13 +188,40 @@ def make_dpi_aware() -> None:
             if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
                 return
         try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
-            return
+            set_awareness = ctypes.windll.shcore.SetProcessDpiAwareness
+            set_awareness.argtypes = [ctypes.c_int]
+            set_awareness.restype = ctypes.c_long  # HRESULT: failure is a return value, not a Python exception
+            if set_awareness(2) == 0:
+                return
         except Exception:
             pass
         user32.SetProcessDPIAware()
     except Exception as exc:  # pragma: no cover - depends on Windows version
         log.debug("DPI awareness could not be set: %s", exc)
+
+
+@contextmanager
+def physical_coordinates():
+    """Use physical screen geometry/capture even if a GUI/host already fixed process DPI awareness.
+
+    Windows can virtualise coordinates per thread. The agent worker is not the Qt thread, and
+    the two may otherwise disagree. Restore the caller's context on success AND failure.
+    """
+    previous = None
+    set_context = None
+    if IS_WINDOWS:
+        try:
+            set_context = ctypes.windll.user32.SetThreadDpiAwarenessContext
+            set_context.argtypes = [ctypes.c_void_p]
+            set_context.restype = ctypes.c_void_p
+            previous = set_context(ctypes.c_void_p(-4)) or set_context(ctypes.c_void_p(-3))
+        except (AttributeError, OSError):  # older Windows: fall back to process awareness set at startup
+            log.debug("Thread DPI context is unavailable; using process DPI awareness.")
+    try:
+        yield
+    finally:
+        if previous and set_context is not None:
+            set_context(previous)
 
 
 class _HotkeyListener(threading.Thread):
@@ -278,10 +306,10 @@ class WindowsBackend(DesktopBackend):
         u = self.user32
         u.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
         u.SendInput.restype = wintypes.UINT
-        u.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
-        u.SetCursorPos.restype = wintypes.BOOL
-        u.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
-        u.GetCursorPos.restype = wintypes.BOOL
+        u.SetPhysicalCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+        u.SetPhysicalCursorPos.restype = wintypes.BOOL
+        u.GetPhysicalCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        u.GetPhysicalCursorPos.restype = wintypes.BOOL
         u.GetSystemMetrics.argtypes = [ctypes.c_int]
         u.GetSystemMetrics.restype = ctypes.c_int
         u.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
@@ -365,6 +393,7 @@ class WindowsBackend(DesktopBackend):
             self.dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
 
     # ----------------------------------------------------------------- screen
+    @physical_coordinates()
     def screen_geometry(self, all_screens: bool = False) -> ScreenGeometry:
         gm = self.user32.GetSystemMetrics
         monitors = gm(SM_CMONITORS)
@@ -375,6 +404,7 @@ class WindowsBackend(DesktopBackend):
         geo.extra = {"monitors": monitors}
         return geo
 
+    @physical_coordinates()
     def capture(self, all_screens: bool = False, region: Optional[tuple[int, int, int, int]] = None) -> Image.Image:
         try:
             # Include layered windows (CAPTUREBLT) so they do not disappear from the captured desktop.
@@ -392,7 +422,8 @@ class WindowsBackend(DesktopBackend):
     # ------------------------------------------------------------------ mouse
     def mouse_position(self) -> tuple[int, int]:
         pt = wintypes.POINT()
-        self.user32.GetCursorPos(ctypes.byref(pt))
+        if not self.user32.GetPhysicalCursorPos(ctypes.byref(pt)):
+            raise BackendError("GetPhysicalCursorPos failed; check the interactive desktop session.")
         return int(pt.x), int(pt.y)
 
     def _send(self, inputs: list[INPUT]) -> None:
@@ -422,13 +453,23 @@ class WindowsBackend(DesktopBackend):
             t = 1 - (1 - t) ** 2
             cx = round(sx + (x - sx) * t)
             cy = round(sy + (y - sy) * t)
-            self.user32.SetCursorPos(cx, cy)
+            if not self.user32.SetPhysicalCursorPos(cx, cy):
+                raise BackendError("SetPhysicalCursorPos failed; pointer movement aborted.")
             if steps > 1:
                 time.sleep(duration / steps)
-        self.user32.SetCursorPos(x, y)
-        self._last_move = (x, y)
+        if not self.user32.SetPhysicalCursorPos(x, y):
+            raise BackendError("SetPhysicalCursorPos failed; pointer movement aborted.")
         # a zero-delta MOVE event makes hover states update in some apps
         self._send([self._mouse_input(MOUSEEVENTF_MOVE)])
+        self._require_pointer(x, y)
+        self._last_move = (x, y)
+
+    def _require_pointer(self, x: int, y: int) -> None:
+        actual = self.mouse_position()
+        if actual != (x, y):
+            raise BackendError(f"Pointer did not reach physical ({x},{y}); it is at {actual}. "
+                               "Refusing to continue with mismatched coordinates. The pointer may be clipped, the display may have changed, "
+                               "or another input source moved it. Take a new screenshot before trying again.")
 
     @staticmethod
     def _button_flags(button: str) -> tuple[int, int, int]:
@@ -450,6 +491,7 @@ class WindowsBackend(DesktopBackend):
         if x is not None and y is not None:
             self.mouse_move(x, y, duration=0.15)
             time.sleep(0.05)
+            self._require_pointer(int(x), int(y))  # fail closed if it moved during the hover delay
         down, up, data = self._button_flags(button)
         mods = [normalize_key(m) for m in (modifiers or [])]
         try:
@@ -682,6 +724,7 @@ class WindowsBackend(DesktopBackend):
         self.user32.GetClassNameW(hwnd, buf, 256)
         return buf.value
 
+    @physical_coordinates()
     def _rect(self, hwnd: int) -> tuple[int, int, int, int]:
         rect = wintypes.RECT()
         if self.dwmapi is not None:
@@ -805,6 +848,7 @@ class WindowsBackend(DesktopBackend):
             time.sleep(0.1)
         return int(self.user32.GetForegroundWindow() or 0) == hwnd
 
+    @physical_coordinates()
     def window_action(self, hwnd: int, action: str, x: Optional[int] = None, y: Optional[int] = None,
                       width: Optional[int] = None, height: Optional[int] = None) -> str:
         hwnd = int(hwnd)
@@ -839,6 +883,7 @@ class WindowsBackend(DesktopBackend):
         left, top, right, bottom = self._rect(hwnd)
         return f"Window {hwnd}: {action} done. New rect=({left},{top})-({right},{bottom})."
 
+    @physical_coordinates()
     def window_controls(self, hwnd: int, limit: int = 200) -> list[ControlInfo]:
         hwnd = int(hwnd)
         controls: list[ControlInfo] = []

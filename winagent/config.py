@@ -79,6 +79,7 @@ class Config:
     # --- Agent behaviour -----------------------------------------------------
     tool_protocol: str = "auto"          # auto | native | json
     max_steps: int = 40                  # max tool-calling rounds per task
+    max_response_retries: int = 3        # additional requests for malformed/truncated model output
     vision_enabled: bool = True          # send screenshots as images
     auto_screenshot_after_action: bool = True
     action_delay: float = 0.6            # seconds to wait after UI actions before screenshot
@@ -141,6 +142,8 @@ class Config:
             problems.append(f"overlay_corner must be one of {OVERLAY_CORNERS}.")
         if self.max_steps < 1:
             problems.append("max_steps must be >= 1.")
+        if not (0 <= self.max_response_retries <= 10):
+            problems.append("max_response_retries must be between 0 and 10.")
         if self.screenshot_max_width < 320:
             problems.append("screenshot_max_width must be >= 320.")
         if not (0.0 <= self.temperature <= 2.0):

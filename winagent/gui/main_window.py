@@ -808,6 +808,10 @@ class MainWindow(QMainWindow):
 
 
 def run_gui(config: Config, config_path: Optional[Path] = None, backend_override: Optional[str] = None) -> int:
+    # DPI mode must be selected before Qt creates any native windows; backend init alone is too late.
+    from ..backends.windows import make_dpi_aware
+
+    make_dpi_aware()
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(__app_name__)
     app.setStyleSheet(STYLESHEET)

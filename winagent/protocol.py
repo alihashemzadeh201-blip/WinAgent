@@ -23,13 +23,12 @@ Both formats produce the same internal :class:`ToolCall` objects.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
-
-from .tools.definitions import TOOLS_BY_NAME
+from typing import Any
 
 
 @dataclass
@@ -124,21 +123,25 @@ def _loads_lenient(blob: str) -> Any:
         return json.loads(blob)
     except json.JSONDecodeError:
         pass
-    # common LLM slips: trailing commas, single quotes around keys, python literals
-    fixed = re.sub(r",\s*([}\]])", r"\1", blob)
-    fixed = fixed.replace("\u201c", '"').replace("\u201d", '"')
-    fixed = re.sub(r"\bTrue\b", "true", fixed)
-    fixed = re.sub(r"\bFalse\b", "false", fixed)
-    fixed = re.sub(r"\bNone\b", "null", fixed)
+    # Repair only tokens OUTSIDE strings. A trailing comma elsewhere must not rewrite typed text
+    # such as "True, } None" or curly quotes inside a filename/document.
+    tokens = re.compile(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|,(?=\s*[}\]])|\b(?:True|False|None)\b|[\u201c\u201d]''')
+
+    def repair(match):
+        token = match.group(0)
+        return {",": "", "True": "true", "False": "false", "None": "null", "\u201c": '"', "\u201d": '"'}.get(token, token)
+
+    fixed = tokens.sub(repair, blob)
     try:
         return json.loads(fixed)
     except json.JSONDecodeError:
         pass
-    # last resort: json5-like single quotes
-    if "'" in fixed and '"' not in fixed:
+    if "'" in blob:
         try:
-            return json.loads(fixed.replace("'", '"'))
-        except json.JSONDecodeError:
+            value = ast.literal_eval(blob)  # parse literals only; never eval() model output
+            json.dumps(value, allow_nan=False)  # disallow non-JSON Python objects (sets, bytes, ...)
+            return value
+        except (ValueError, SyntaxError, TypeError):
             pass
     raise ProtocolError("not JSON")
 
@@ -165,116 +168,204 @@ def parse_json_arguments(raw: Any) -> dict[str, Any]:
                         return inner
                 except json.JSONDecodeError:
                     pass
-        raise ProtocolError(f"Could not parse tool arguments: {raw[:200]!r}")
+        raise ProtocolError("Tool arguments are not a complete JSON object.")
     raise ProtocolError(f"Unsupported argument type {type(raw).__name__}")
 
 
-def _normalise_action(item: Any) -> Optional[ToolCall]:
-    """Turn one of the many shapes LLMs produce into a ToolCall."""
+def response_text(content: Any) -> str:
+    """Read text content without coercing malformed objects into plausible assistant answers."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for part in content:
+            if not isinstance(part, dict) or not isinstance(part.get("text"), str):
+                raise ProtocolError("Invalid assistant content part: expected text.")
+            texts.append(part["text"])
+        return "".join(texts)
+    raise ProtocolError("Invalid assistant content: expected a string or text parts.")
+
+
+def _normalise_action(item: Any) -> ToolCall:
+    """Normalise common tool-call shapes, but NEVER invent arguments or skip a broken action."""
+    from .tools.definitions import TOOLS_BY_NAME  # lazy: the executor also imports this module
+
     if not isinstance(item, dict):
-        return None
+        raise ProtocolError("Each action must be an object.")
     name = item.get("tool") or item.get("name") or item.get("action") or item.get("function") or item.get("tool_name")
-    if isinstance(name, dict):  # {"function": {"name":..., "arguments":...}}
+    if isinstance(name, dict):
         inner = name
         name = inner.get("name")
         args = inner.get("arguments", inner.get("args", {}))
     else:
-        args = item.get("args", item.get("arguments", item.get("parameters", item.get("input", item.get("params")))))
-    if not isinstance(name, str) or not name:
-        return None
-    if args is None:
-        # arguments may be inline: {"tool": "click", "x": 1, "y": 2}
-        args = {k: v for k, v in item.items() if k not in ("tool", "name", "action", "function", "tool_name", "id", "thought", "reasoning")}
+        arg_key = next((k for k in ("args", "arguments", "parameters", "input", "params") if k in item), None)
+        args = item[arg_key] if arg_key else {
+            k: v for k, v in item.items()
+            if k not in ("tool", "name", "action", "function", "tool_name", "id", "thought", "reasoning", "message")
+        }
+    if not isinstance(name, str) or not name.strip():
+        raise ProtocolError("A tool call is missing its name.")
+    name = name.strip()
     if isinstance(args, str):
-        try:
-            args = parse_json_arguments(args)
-        except ProtocolError:
-            args = {"value": args}
+        if not args.strip():
+            raise ProtocolError(f"Arguments for {name} are empty; use an explicit JSON object.")
+        args = parse_json_arguments(args)
     if not isinstance(args, dict):
-        args = {"value": args}
-    call_id = item.get("id") if isinstance(item.get("id"), str) else None
-    tc = ToolCall(name=name.strip(), arguments=args)
+        raise ProtocolError(f"Arguments for {name} must be a JSON object.")
+    spec = TOOLS_BY_NAME.get(name)
+    if spec:
+        missing = [k for k in spec.parameters.get("required", []) if k not in args]
+        if missing:
+            raise ProtocolError(f"Missing required arguments for {name}: {', '.join(missing)}.")
+    if name in ("click", "scroll") and ((args.get("x") is None) != (args.get("y") is None)):
+        raise ProtocolError(f"{name} needs both x and y, or neither for the current pointer position.")
+    call_id = item.get("id")
+    if call_id is not None and (not isinstance(call_id, str) or not call_id.strip()):
+        raise ProtocolError("A tool-call id must be a non-empty string.")
+    tc = ToolCall(name=name, arguments=args)
     if call_id:
         tc.id = call_id
     return tc
 
 
-def parse_json_protocol(content: str) -> AssistantTurn:
-    """Parse the fallback JSON protocol out of a plain assistant message."""
-    turn = AssistantTurn(raw_content=content or "")
-    if not content or not content.strip():
-        return turn
+_COORDINATE_TAIL = r"y\s+from\s+0\s*\(top\)\s+to\s+\d+\s*\(bottom\)"
+
+
+def _is_screenshot_echo(text: str) -> bool:
+    """Recognise standalone capture metadata, not ordinary answers discussing screen coordinates."""
+    text = text.strip().strip("`").strip()
+    if re.fullmatch(r"(?:document\s*,\s*)?" + _COORDINATE_TAIL + r"[.\]\s]*", text, re.I):
+        return True
+    return bool(re.match(r"\[?(?:Screenshot \d+[x×]\d+ px|Current screen attached\.|"
+                         r"Screenshot after the actions above\.|Coordinates you send must be)", text, re.I)
+                and re.search(_COORDINATE_TAIL + r"[.\]\s]*$", text, re.I))
+
+
+def _bad_turn(content: str, error: str) -> AssistantTurn:
+    # Reject the whole batch: the caller must not execute a valid prefix and then retry it.
+    return AssistantTurn(raw_content=content, parse_error=error)
+
+
+def _field_text(data: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = data.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ProtocolError(f"{key} must be text.")
+        if value and value.strip():
+            return value.strip()
+    return ""
+
+
+def parse_json_protocol(content: str, *, allow_plain_text: bool = False) -> AssistantTurn:
+    """Parse JSON-in-text. Plain prose is allowed only for the native protocol's fallback parser."""
+    from .tools.definitions import TOOLS_BY_NAME
+
+    if not isinstance(content, str) or not content.strip():
+        return _bad_turn(content if isinstance(content, str) else "", "Empty or non-text model response.")
+    if _is_screenshot_echo(content):
+        return _bad_turn(content, "The response only echoes screenshot coordinate metadata, not an answer or action.")
     for blob in _candidate_json_blobs(content):
         try:
             data = _loads_lenient(blob)
         except ProtocolError:
             continue
         if isinstance(data, list):
+            if allow_plain_text and data and not any(
+                isinstance(item, dict) and any(k in item for k in ("tool", "name", "action", "function")) for item in data
+            ):
+                continue  # a native answer may be an ordinary JSON data array
             data = {"actions": data}
         if not isinstance(data, dict):
             continue
-        # single action object at top level
-        if any(k in data for k in ("tool", "name", "action", "function")) and "actions" not in data:
-            single = _normalise_action(data)
-            if single and single.name in TOOLS_BY_NAME:
-                turn.tool_calls = [single]
-                turn.thought = str(data.get("thought") or data.get("reasoning") or "")
-                turn.text = str(data.get("message") or "")
-                return turn
-        if "actions" in data or "tool_calls" in data or "message" in data or "final_answer" in data:
-            turn.thought = str(data.get("thought") or data.get("reasoning") or "")
-            turn.text = str(data.get("message") or data.get("final_answer") or data.get("response") or "")
-            for item in data.get("actions") or data.get("tool_calls") or []:
-                tc = _normalise_action(item)
-                if tc:
-                    turn.tool_calls.append(tc)
+        single = any(k in data for k in ("tool", "action", "function", "tool_name")) or (
+            "name" in data and ((isinstance(data["name"], str) and data["name"] in TOOLS_BY_NAME)
+                               or any(k in data for k in ("args", "arguments", "parameters"))))
+        if not single and not any(k in data for k in ("actions", "tool_calls", "message", "final_answer", "response",
+                                                      "thought", "reasoning", "done")):
+            continue
+        try:
+            turn = AssistantTurn(raw_content=content, text=_field_text(data, "message", "final_answer", "response"),
+                                 thought=_field_text(data, "thought", "reasoning"))
+            if single and "actions" not in data and "tool_calls" not in data:
+                turn.tool_calls = [_normalise_action(data)]
+            else:
+                actions = data.get("actions", data.get("tool_calls", []))
+                if not isinstance(actions, list):
+                    raise ProtocolError("actions/tool_calls must be an array.")
+                if data.get("actions") and data.get("tool_calls"):
+                    raise ProtocolError("Use one action list, not both actions and tool_calls.")
+                turn.tool_calls = [_normalise_action(item) for item in actions]
+            ids = [tc.id for tc in turn.tool_calls]
+            if len(ids) != len(set(ids)):
+                raise ProtocolError("Duplicate tool-call ids.")
+            if not turn.tool_calls and _is_screenshot_echo(turn.text):
+                raise ProtocolError("The response only echoes screenshot coordinate metadata.")
             if data.get("done") is True and not turn.tool_calls and turn.text:
                 turn.tool_calls.append(ToolCall("task_complete", {"summary": turn.text, "success": True}))
+            if not turn.tool_calls and not turn.text:
+                raise ProtocolError("The response contains no actions or user-facing answer (reasoning alone is incomplete).")
             return turn
-    # not JSON -> plain text answer
-    turn.text = content.strip()
-    return turn
+        except ProtocolError as exc:
+            return _bad_turn(content, str(exc))
+    # Don't disguise truncated JSON/function calls as a successful plain-text answer.
+    looks_structured = bool(re.match(r"\s*(?:\{|\[\s*(?:\{|\[|\"|\d|\]))", content)
+                            or re.search(r'```\s*json\b|["\'](?:actions|tool_calls)["\']\s*:', content, re.I))
+    if allow_plain_text and not looks_structured:
+        return AssistantTurn(text=content.strip(), raw_content=content)
+    # Native models may legitimately answer a data question with a complete, non-protocol JSON document.
+    if allow_plain_text:
+        try:
+            data = json.loads(content)
+        except (ValueError, TypeError):
+            pass
+        else:
+            if data != {}:
+                return AssistantTurn(text=content.strip(), raw_content=content)
+    return _bad_turn(content, "Expected a complete JSON object with actions or a non-empty message.")
 
 
 def parse_native_response(message: dict[str, Any]) -> AssistantTurn:
-    """Parse an OpenAI ``message`` object that may contain ``tool_calls``."""
-    content = message.get("content")
-    if isinstance(content, list):  # some servers return content parts
-        content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
-    content = content or ""
-    turn = AssistantTurn(raw_content=content)
-    reasoning = message.get("reasoning_content") or message.get("reasoning")
-    if isinstance(reasoning, str):
-        turn.thought = reasoning.strip()
-    calls = message.get("tool_calls") or []
-    if not calls and message.get("function_call"):  # legacy single function call
-        fc = message["function_call"]
-        calls = [{"id": None, "function": fc}]
-    for c in calls:
-        fn = c.get("function") or {}
-        name = fn.get("name") or c.get("name")
-        if not name:
-            continue
-        raw_args = fn.get("arguments", c.get("arguments", "{}"))
-        try:
-            args = parse_json_arguments(raw_args)
-        except ProtocolError as exc:
-            turn.parse_error = str(exc)
-            args = {}
-        tc = ToolCall(name=name, arguments=args, raw_arguments=raw_args if isinstance(raw_args, str) else json.dumps(raw_args))
-        if c.get("id"):
-            tc.id = c["id"]
-        turn.tool_calls.append(tc)
-    if turn.tool_calls:
-        turn.text = content.strip()
-        return turn
-    # Some models with native support still answer with the JSON protocol in text.
-    parsed = parse_json_protocol(content)
-    if parsed.tool_calls:
-        parsed.thought = parsed.thought or turn.thought
+    """Parse OpenAI content/tool calls atomically; malformed arguments never turn into an empty click."""
+    content = ""
+    try:
+        if not isinstance(message, dict):
+            raise ProtocolError("The assistant message must be an object.")
+        refusal = message.get("refusal")
+        if isinstance(refusal, str) and refusal.strip():
+            return AssistantTurn(text=refusal.strip())
+        content = response_text(message.get("content"))
+        thought = next((message[k].strip() for k in ("reasoning_content", "reasoning")
+                        if isinstance(message.get(k), str) and message[k].strip()), "")
+        calls = message.get("tool_calls")
+        if calls is None:
+            calls = []
+        if not isinstance(calls, list):
+            raise ProtocolError("tool_calls must be an array.")
+        if not calls and message.get("function_call") is not None:
+            calls = [{"function": message["function_call"]}]
+        parsed_calls = []
+        for c in calls:
+            if not isinstance(c, dict):
+                raise ProtocolError("Each tool call must be an object.")
+            fn = c.get("function", c)
+            if not isinstance(fn, dict):
+                raise ProtocolError("A tool-call function must be an object.")
+            raw_args = fn.get("arguments", {})
+            tc = _normalise_action({"name": fn.get("name"), "args": raw_args, "id": c.get("id")})
+            tc.raw_arguments = raw_args if isinstance(raw_args, str) else json.dumps(raw_args)
+            parsed_calls.append(tc)
+        ids = [tc.id for tc in parsed_calls]
+        if len(ids) != len(set(ids)):
+            raise ProtocolError("Duplicate tool-call ids.")
+        if parsed_calls:
+            return AssistantTurn(text=content.strip(), thought=thought, tool_calls=parsed_calls, raw_content=content)
+        parsed = parse_json_protocol(content, allow_plain_text=True)
+        parsed.thought = parsed.thought or thought
         return parsed
-    turn.text = content.strip()
-    return turn
+    except ProtocolError as exc:
+        return _bad_turn(content, str(exc))
 
 
 # --------------------------------------------------------------------------

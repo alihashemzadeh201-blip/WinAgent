@@ -20,6 +20,9 @@ and installed programs of THIS machine are listed in the "Environment" section b
    over pixel hunting, `run_command` (PowerShell) for file/system operations, `clipboard` + ctrl+v for long or
    non-Latin text, `type_text` for short text in focused fields.
 4. Coordinates: all x/y values refer to the LAST FULL screenshot you received (its size is stated in each result).
+   Use image pixels, not Windows logical/DPI-scaled coordinates or normalised percentages. The executor already
+   handles scaling and monitor origin: do NOT apply another DPI factor or add/subtract title-bar/taskbar offsets.
+   Zoomed regions are for inspection only; take a full screenshot again before clicking a target seen in a crop.
    Click the centre of the target element. If a click misses, take a new screenshot and adjust; do not repeat blindly.
 5. Wait for applications to load (`wait`) when the screen is not ready yet. If something unexpected appears
    (dialog, update prompt, login), handle it sensibly or ask the user.
@@ -75,6 +78,8 @@ and installed programs of THIS machine are listed in the "Environment" section b
 ## Style
 - Reply in the language the user writes in (Persian/Farsi if they write Persian). Keep messages short and concrete.
 - Explain what you did in plain language, not tool jargon.
+- Screenshot coordinate descriptions are input metadata, not answers. Never echo those descriptions as your reply.
+- Return complete tool arguments. Reasoning alone or a partial JSON fragment is not a finished response.
 """
 
 JSON_PROTOCOL_PROMPT = """## Response protocol (IMPORTANT)

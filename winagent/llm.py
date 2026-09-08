@@ -28,6 +28,10 @@ class LLMError(RuntimeError):
         self.body = body
 
 
+class LLMResponseError(LLMError):
+    """A successful HTTP response had an unusable envelope or assistant message."""
+
+
 class LLMCancelled(LLMError):
     pass
 
@@ -124,7 +128,7 @@ class LLMClient:
                 try:
                     data = resp.json()
                 except ValueError as exc:
-                    raise LLMError(f"Non-JSON response from server: {resp.text[:300]}", resp.status_code, resp.text) from exc
+                    raise LLMResponseError("Server returned HTTP 200 but not valid JSON.", resp.status_code, resp.text[:2000]) from exc
                 return self._parse(data, latency)
 
             body = resp.text[:2000]
@@ -168,18 +172,31 @@ class LLMClient:
         raise last_exc or LLMError("LLM request failed.")
 
     def _parse(self, data: dict[str, Any], latency: float) -> ChatResponse:
-        choices = data.get("choices") or []
-        if not choices:
+        if not isinstance(data, dict):
+            raise LLMResponseError("Response envelope must be a JSON object.")
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
             if "error" in data:
                 raise LLMError(f"Server error: {_extract_error(json.dumps(data))}", body=json.dumps(data)[:2000])
-            raise LLMError(f"Response has no choices: {json.dumps(data)[:300]}")
+            raise LLMResponseError("Response has no valid choices array.")
         choice = choices[0]
-        message = choice.get("message") or {}
+        if not isinstance(choice, dict):
+            raise LLMResponseError("Response choice must be an object.")
+        message = choice.get("message")
+        if message is None:
+            message = {}
+        if not isinstance(message, dict):
+            raise LLMResponseError("Assistant message must be an object.")
         if not message and "text" in choice:  # legacy completions style
             message = {"role": "assistant", "content": choice["text"]}
         usage = data.get("usage") or {}
-        self.total_prompt_tokens += int(usage.get("prompt_tokens") or 0)
-        self.total_completion_tokens += int(usage.get("completion_tokens") or 0)
+        if not isinstance(usage, dict):
+            usage = {}
+        for key, attr in (("prompt_tokens", "total_prompt_tokens"), ("completion_tokens", "total_completion_tokens")):
+            try:
+                setattr(self, attr, getattr(self, attr) + max(0, int(usage.get(key) or 0)))
+            except (ValueError, TypeError, OverflowError):
+                pass  # malformed optional accounting must not invalidate an otherwise usable response
         if message.get("tool_calls"):
             self.supports_tools = True
         return ChatResponse(message=message, finish_reason=str(choice.get("finish_reason") or ""), usage=usage,

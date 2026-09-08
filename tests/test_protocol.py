@@ -69,10 +69,12 @@ def test_parse_json_protocol_list_and_name_arguments_shapes():
     assert turn.tool_calls[0].arguments == {"seconds": 2}
 
 
-def test_parse_json_protocol_plain_text_passthrough():
-    turn = parse_json_protocol("I cannot do that, sorry.")
-    assert turn.text == "I cannot do that, sorry."
-    assert not turn.has_tool_calls
+def test_json_protocol_requires_json_but_native_keeps_plain_answers():
+    text = "I cannot do that, sorry."
+    turn = parse_json_protocol(text)
+    assert turn.parse_error and not turn.has_tool_calls and not turn.text
+    native = parse_native_response({"content": text})
+    assert native.text == text and not native.parse_error
 
 
 def test_parse_json_protocol_done_flag_becomes_task_complete():

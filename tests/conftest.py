@@ -53,6 +53,8 @@ class ScriptedLLM:
             raise item
         if callable(item):
             item = item(messages)
+        if isinstance(item, ChatResponse):
+            return item
         if isinstance(item, str):
             message = {"role": "assistant", "content": item}
         else:

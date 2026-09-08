@@ -2,8 +2,8 @@
 
 The model sees a *scaled* copy of the screen (to keep token cost low) with an
 optional coordinate grid drawn on it, so that it can reason about positions.
-:class:`Screenshot` remembers the scale factor so the tool executor can map
-model coordinates back to physical pixels.
+:class:`Screenshot` records the actual size ratio on each axis so the tool
+executor can map model coordinates back to physical pixels without height-rounding drift.
 """
 
 from __future__ import annotations
@@ -23,27 +23,37 @@ from .backends.base import ScreenGeometry
 class Screenshot:
     image: Image.Image             # the (possibly annotated, scaled) image sent to the model
     raw_size: tuple[int, int]      # physical capture size (w, h)
-    scale: float                   # image px  = physical px * scale
+    scale: float                   # nominal width scale (compatibility); mappings use actual per-axis ratios
     origin: tuple[int, int] = (0, 0)   # physical offset of the capture (multi-monitor / region)
     taken_at: float = field(default_factory=time.time)
     fmt: str = "jpeg"
     quality: int = 70
+    is_region: bool = False        # zoomed detail does not replace the executor's full-screen click frame
     _encoded: Optional[bytes] = field(default=None, repr=False)
 
     @property
     def size(self) -> tuple[int, int]:
         return self.image.size
 
+    @property
+    def scale_x(self) -> float:
+        return self.image.width / self.raw_size[0]
+
+    @property
+    def scale_y(self) -> float:
+        # Resized height is rounded independently; reusing the width scale introduces vertical drift.
+        return self.image.height / self.raw_size[1]
+
     def to_physical(self, x: float, y: float) -> tuple[int, int]:
-        """Convert model (image) coordinates to physical screen coordinates."""
-        px = int(round(x / self.scale)) + self.origin[0]
-        py = int(round(y / self.scale)) + self.origin[1]
+        """Convert model coordinates using the ACTUAL encoded image dimensions on each axis."""
+        px = int(round(x * self.raw_size[0] / self.image.width)) + self.origin[0]
+        py = int(round(y * self.raw_size[1] / self.image.height)) + self.origin[1]
         return px, py
 
     def to_image(self, x: float, y: float) -> tuple[int, int]:
-        """Convert physical coordinates to model (image) coordinates."""
-        ix = int(round((x - self.origin[0]) * self.scale))
-        iy = int(round((y - self.origin[1]) * self.scale))
+        """Convert physical coordinates to image pixels (the inverse of to_physical)."""
+        ix = int(round((x - self.origin[0]) * self.image.width / self.raw_size[0]))
+        iy = int(round((y - self.origin[1]) * self.image.height / self.raw_size[1]))
         return ix, iy
 
     def encode(self) -> bytes:
@@ -62,9 +72,15 @@ class Screenshot:
 
     def describe(self) -> str:
         w, h = self.image.size
-        return (f"Screenshot {w}x{h} px (scaled {self.scale:.3f}x from physical {self.raw_size[0]}x{self.raw_size[1]}). "
-                f"Coordinates you send must be in this {w}x{h} space: x from 0 (left) to {w - 1} (right), "
-                f"y from 0 (top) to {h - 1} (bottom).")
+        description = (f"Screenshot {w}x{h} px (physical capture {self.raw_size[0]}x{self.raw_size[1]}; "
+                       f"scale x={self.scale_x:.6f}, y={self.scale_y:.6f}). ")
+        if self.is_region:
+            return description + ("ZOOMED detail for inspection only; pointer actions still use the LAST FULL screenshot. "
+                                  "Take a full screenshot before clicking this area; do not use this crop's local coordinates.")
+        return description + (
+            "Use image pixels as given: display DPI and scaling are already handled; do not add window/title-bar/taskbar offsets. "
+            f"Coordinates you send must be in this {w}x{h} space: x from 0 (left) to {w - 1} (right), "
+            f"y from 0 (top) to {h - 1} (bottom).")
 
 
 def _font(size: int):
