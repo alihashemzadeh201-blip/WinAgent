@@ -34,13 +34,13 @@ def test_native_flow_completes_task(config, backend):
     assert llm.calls[0]["tools"] is not None
 
 
-def test_plain_text_answer_ends_turn(config, backend):
-    llm = ScriptedLLM(["Hi! I'm WinAgent."])
+def test_explicit_message_answer_ends_turn(config, backend):
+    llm = ScriptedLLM([json.dumps({"message": "Hi! I'm WinAgent."})])
     agent = make_agent(config, backend, llm)
     outcome = agent.run("hi")
     assert outcome.status == "answered"
     assert outcome.message == "Hi! I'm WinAgent."
-    assert agent.history[-1]["content"] == "Hi! I'm WinAgent."
+    assert json.loads(agent.history[-1]["content"]) == {"message": "Hi! I'm WinAgent."}
 
 
 def test_json_protocol_flow(config, backend):
@@ -206,11 +206,11 @@ def test_image_trimming_keeps_only_recent_screenshots(config, backend):
 
 
 def test_conversation_persists_between_runs(config, backend):
-    llm = ScriptedLLM(["first answer", "second answer"])
+    llm = ScriptedLLM([json.dumps({"message": text}) for text in ("first answer", "second answer")])
     agent = make_agent(config, backend, llm)
     agent.run("q1")
     agent.run("q2")
     msgs = llm.calls[1]["messages"]
-    assert any(m["role"] == "assistant" and m["content"] == "first answer" for m in msgs)
+    assert any(m["role"] == "assistant" and json.loads(m["content"])["message"] == "first answer" for m in msgs)
     agent.reset()
     assert agent.history == []

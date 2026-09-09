@@ -25,47 +25,53 @@ def tools(protocol, *calls):
 
 
 @pytest.mark.parametrize("protocol", ["native", "json"])
-def test_batch_uses_the_image_seen_before_auto_capture_changes_width(config, backend, monkeypatch, protocol):
+@pytest.mark.parametrize("first_tool", ["mouse_move", "click"])
+def test_batch_uses_the_image_seen_before_auto_capture_changes_width(config, backend, monkeypatch, protocol, first_tool):
     config.tool_protocol = protocol
-    move = backend.mouse_move
+    first_action = getattr(backend, "mouse_move" if first_tool == "mouse_move" else "mouse_click")
     def change_width(*args, **kwargs):
-        move(*args, **kwargs)
+        first_action(*args, **kwargs)
         config.screenshot_max_width = 768  # used to shift the next click 17 physical pixels down
-    monkeypatch.setattr(backend, "mouse_move", change_width)
+    monkeypatch.setattr(backend, "mouse_move" if first_tool == "mouse_move" else "mouse_click", change_width)
     results, images = [], []
     llm = ScriptedLLM([
-        tools(protocol, ("mouse_move", {"x": 100, "y": 100}), ("click", {"x": 300, "y": 200})),
+        tools(protocol, (first_tool, {"x": 100, "y": 100}), ("click", {"x": 300, "y": 200})),
         tools(protocol, ("click", {"x": 300, "y": 200})),
         tools(protocol, ("task_complete", {"summary": "done"})),
     ])
     agent = Agent(config, backend, llm, AgentEvents(on_tool_end=results.append, on_screenshot=images.append))
     assert agent.run("move then click twice").status == "completed"
-    assert clicks(backend) == [(600, 400), (625, 417)]  # old frame for the batch, new frame for the NEXT response
+    prefix = [(200, 200)] if first_tool == "click" else []
+    assert clicks(backend) == prefix + [(600, 400), (625, 417)]  # old batch frame, new frame for the NEXT response
+    assert (results[0].screenshot is not None) == (first_tool == "click")
     assert images[0].size == (800, 450) and images[1].size == (768, 432)
     mapping = results[1].data["coordinate_mapping"][0]
     assert mapping["frame_id"] == images[0].frame_id
     assert mapping["image_point"] == [300, 200] and mapping["physical_target"] == [600, 400]
-    assert results[1].data["pointer_after_action"] == (600, 400)
+    assert "pointer_after_action" not in results[1].data
 
 
 @pytest.mark.parametrize("protocol", ["native", "json"])
-def test_unseen_full_capture_before_a_crop_does_not_become_model_input(config, backend, monkeypatch, protocol):
+@pytest.mark.parametrize("first_tool", ["mouse_move", "click"])
+def test_unseen_full_capture_before_a_crop_does_not_become_model_input(config, backend, monkeypatch, protocol, first_tool):
     config.tool_protocol = protocol
-    move = backend.mouse_move
+    first_action = getattr(backend, "mouse_move" if first_tool == "mouse_move" else "mouse_click")
     def change_width(*args, **kwargs):
-        move(*args, **kwargs)
+        first_action(*args, **kwargs)
         config.screenshot_max_width = 768
-    monkeypatch.setattr(backend, "mouse_move", change_width)
+    monkeypatch.setattr(backend, "mouse_move" if first_tool == "mouse_move" else "mouse_click", change_width)
     images, results = [], []
     llm = ScriptedLLM([
-        tools(protocol, ("mouse_move", {"x": 100, "y": 100}), ("screenshot", {"region": [100, 100, 300, 200]})),
+        tools(protocol, (first_tool, {"x": 100, "y": 100}), ("screenshot", {"region": [100, 100, 300, 200]})),
         tools(protocol, ("get_screen_info", {}), ("click", {"x": 300, "y": 200})),
         tools(protocol, ("task_complete", {"summary": "done"})),
     ])
     agent = Agent(config, backend, llm, AgentEvents(on_screenshot=images.append, on_tool_end=results.append))
     assert agent.run("inspect the region").status == "completed"
-    assert images[2].is_region and images[2].raw_size == (400, 200)  # crop uses original batch coordinates too
-    assert clicks(backend) == [(600, 400)]
+    crop = images[2] if first_tool == "click" else images[1]
+    assert crop.is_region and crop.raw_size == (400, 200)  # original batch coordinates too
+    assert (results[0].screenshot is not None) == (first_tool == "click")
+    assert clicks(backend) == ([(200, 200)] if first_tool == "click" else []) + [(600, 400)]
     assert images[0].frame_id in results[2].data["screenshot_frame"]
     assert results[3].data["coordinate_mapping"][0]["frame_id"] == images[0].frame_id
 
@@ -192,7 +198,7 @@ def test_explicit_unframed_input_does_not_pick_up_an_unseen_capture(config, back
 
 
 def test_agent_reset_discards_the_model_coordinate_frame(config, backend):
-    agent = Agent(config, backend, ScriptedLLM(["hello"]))
+    agent = Agent(config, backend, ScriptedLLM(['{"message":"hello"}']))
     agent.run("hello")
     assert agent._model_frame is not None
     agent.reset()

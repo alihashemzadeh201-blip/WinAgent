@@ -466,3 +466,26 @@ def test_screenshot_preview_identifies_normalized_units(demo_window):
     demo_window.manual_screenshot()
     assert "coords 0–1000" in demo_window.shot_label.text()
     assert "normalized_1000" in demo_window.shot_label.toolTip()
+
+
+def test_gui_does_not_finish_on_unstructured_fragment_after_an_action(server, monkeypatch):
+    from tests import mock_server
+
+    original_plan = mock_server.plan
+    requests = []
+    def flaky_plan(messages):
+        requests.append(messages)
+        if len(requests) == 2:  # application launch already succeeded; don't repeat it
+            return "b sideways.", []
+        return original_plan(messages)
+    monkeypatch.setattr(mock_server, "plan", flaky_plan)
+    win = make_window(server)
+    try:
+        run_task(win, "open notepad and write hello")
+        assert "completed" in win.status_label.text().lower()
+        assert "b sideways." not in win.chat.transcript()
+        assert sum(e["kind"] == "open_app" for e in win.backend.events) == 1
+        assert sum(e["kind"] == "type" for e in win.backend.events) == 1
+        assert "task_complete" in requests[2][-1]["content"]
+    finally:
+        win.close()

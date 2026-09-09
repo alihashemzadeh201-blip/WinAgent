@@ -198,9 +198,9 @@ def test_retry_keeps_the_requested_coordinate_contract_even_if_settings_change()
     def broken(messages):
         cfg.coordinate_space = PIXELS
         return "document, y from 0 (top) to 719 (bottom).]"
-    llm = ScriptedLLM([broken, native_tool_message(("mouse_move", {"x": 500, "y": 500})), "done"])
+    llm = ScriptedLLM([broken, native_tool_message(("mouse_move", {"x": 500, "y": 500})), native_tool_message(("task_complete", {"summary": "done"}))])
     agent = Agent(cfg, backend, llm)
-    assert agent.run("move to the centre").status == "answered"
+    assert agent.run("move to the centre").status == "completed"
     assert backend.mouse == (960, 540)
     assert f"Coordinate convention: {NORM}" in llm.calls[1]["messages"][0]["content"]
 
@@ -211,9 +211,9 @@ def test_normalized_without_a_frame_fails_closed_then_requests_a_full_image():
     executor = ToolExecutor(backend, cfg)
     result = executor.execute(ToolCall("click", {"x": 500, "y": 500}))
     assert not result.ok and result.needs_new_screenshot and not backend.events
-    llm = ScriptedLLM([native_tool_message(("mouse_move", {"x": 500, "y": 500}))] * 2 + ["done"])
+    llm = ScriptedLLM([native_tool_message(("mouse_move", {"x": 500, "y": 500}))] * 2 + [native_tool_message(("task_complete", {"summary": "done"}))])
     agent = Agent(cfg, backend, llm)
-    assert agent.run("move", initial_screenshot=False).status == "answered"
+    assert agent.run("move", initial_screenshot=False).status == "completed"
     assert backend.mouse == (960, 540)
     assert sum(e["kind"] == "move" for e in backend.events) == 1
 

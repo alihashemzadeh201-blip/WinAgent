@@ -119,16 +119,25 @@ def test_windows_mouse_targets_physical_pixels_without_an_extra_dpi_factor(physi
     assert events[1].mi.dwFlags == windows.MOUSEEVENTF_LEFTUP
 
 
-def test_pointer_mismatch_blocks_click_instead_of_clicking_below_target(physical_backend):
+@pytest.mark.parametrize("method,args,reads,target", [
+    ("mouse_move", (800, 450), 1, (800, 450)),
+    ("mouse_click", (800, 450), 1, (800, 450)),
+    ("mouse_down", (800, 450), 1, (800, 450)),
+    ("mouse_up", (800, 450), 1, (800, 450)),
+    ("mouse_drag", (100, 200, 800, 450), 2, (800, 450)),
+    ("mouse_scroll", (800, 450, 0, -1), 1, (800, 450)),
+    ("mouse_click", (None, None), 0, (300, 200)),
+    ("mouse_scroll", (None, None, 0, -1), 0, (300, 200)),
+])
+def test_windows_pointer_input_reads_only_the_motion_start_not_target_verification(physical_backend, method, args, reads, target):
     backend, pointer = physical_backend
-    def displaced(x, y):
-        pointer[:] = [x, y + 10]
-        return True
-    backend.user32.SetPhysicalCursorPos.side_effect = displaced
-    with pytest.raises(BackendError, match="Pointer did not reach"):
-        backend.mouse_click(800, 450)
-    assert not any(inp.mi.dwFlags & windows.MOUSEEVENTF_LEFTDOWN
-                   for call in backend._send.call_args_list for inp in call.args[0])
+    getattr(backend, method)(*args)
+    assert tuple(pointer) == target
+    # One initial read per interpolated motion; none at the destination or before button input.
+    assert backend.user32.GetPhysicalCursorPos.call_count == reads
+    backend.user32.GetCursorPos.assert_not_called()
+    backend.user32.SetCursorPos.assert_not_called()
+    assert backend._send.called
 
 
 def test_failed_mouse_api_does_not_click_or_fake_a_position(physical_backend):

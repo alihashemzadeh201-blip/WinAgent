@@ -344,10 +344,6 @@ class ToolExecutor:
             handler = getattr(self, f"_t_{call.name}")
             with self.guard.scope():   # hide our GUI at most once per tool call, restore when the call is over
                 result = handler(call, call.arguments or {})
-                if self._coordinate_mappings and result.ok:
-                    result.data["pointer_after_action"] = self._pointer()
-                    log.info("Pointer after action: frame=%s physical=%s", self.input_screenshot.frame_id,
-                             result.data["pointer_after_action"])
                 # automatic screenshot after UI actions
                 if (spec.screenshot_after and self.config.auto_screenshot_after_action and result.ok
                         and result.screenshot is None and not result.task_complete and result.ask_user is None):

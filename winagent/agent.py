@@ -20,7 +20,7 @@ from typing import Any, Callable, Optional
 from .backends.base import DesktopBackend, EmergencyStop
 from .config import Config
 from .llm import LLMCancelled, LLMClient, LLMError, LLMResponseError
-from .prompts import build_system_prompt
+from .prompts import TASK_IN_PROGRESS_PROMPT, build_system_prompt
 from .protocol import (
     AssistantTurn,
     ProtocolError,
@@ -199,14 +199,15 @@ class Agent:
                 # Snapshot BEFORE HTTP/confirmation callbacks: no later capture may change this response's coordinates.
                 frame = self._model_frame if self.vision else self.executor.last_screenshot
                 coordinate_space = frame.coordinate_space if frame else self.config.coordinate_space
-                turn = self._call_model(coordinate_space=coordinate_space)
+                turn = self._call_model(coordinate_space=coordinate_space, task_in_progress=n_calls > 0)
                 if turn.thought:
                     self.events.on_thought(turn.thought)
 
                 if not turn.tool_calls:
-                    # plain answer -> conversation turn is over
+                    # Only an explicit message envelope (or provider refusal) may finish a chat turn.
                     reply = turn.text  # _call_model has already rejected empty/malformed output
-                    self._append(assistant_message_native(turn) if self.protocol == "native" else assistant_message_json(turn))
+                    # Keep the envelope in history so native chat examples do not teach bare-text completions.
+                    self._append(assistant_message_json(turn))
                     self.events.on_assistant_text(reply)
                     outcome = RunOutcome("answered", reply)
                     break
@@ -324,7 +325,7 @@ class Agent:
             else:
                 self._append(msg)
 
-    def _call_model(self, *, coordinate_space: Optional[str] = None) -> AssistantTurn:
+    def _call_model(self, *, coordinate_space: Optional[str] = None, task_in_progress: bool = False) -> AssistantTurn:
         """Negotiate capabilities and recover bad output BEFORE committing any tool calls to history.
 
         Transport retries live in LLMClient. Response retries have a separate, finite budget; the
@@ -338,8 +339,10 @@ class Agent:
             if self.stop_event.is_set():
                 raise LLMCancelled("stopped")
             messages = self._messages(coordinate_space)
+            if task_in_progress:
+                messages[0]["content"] += "\n" + TASK_IN_PROGRESS_PROMPT
             if repair_reason:
-                messages.append({"role": "user", "content": self._response_repair_prompt(repair_reason)})
+                messages.append({"role": "user", "content": self._response_repair_prompt(repair_reason, task_in_progress=task_in_progress)})
             try:
                 resp = self.llm.chat(messages, tools=openai_tool_schemas(coordinate_space)) if self.protocol == "native" else self.llm.chat(messages)
                 if self.stop_event.is_set():
@@ -355,11 +358,14 @@ class Agent:
                 if resp.finish_reason in ("length", "max_tokens", "max_output_tokens"):
                     raise LLMResponseError("The response was truncated by the output-token limit. Reply more concisely.")
                 if self.protocol == "native" or resp.message.get("tool_calls") or resp.message.get("function_call") is not None:
-                    turn = parse_native_response(resp.message)
+                    turn = parse_native_response(resp.message, allow_plain_text=False)
                 else:
                     turn = parse_json_protocol(response_text(resp.message.get("content")))
                 if turn.parse_error:
                     raise LLMResponseError(turn.parse_error)
+                if task_in_progress and not turn.tool_calls:
+                    raise LLMResponseError("Tool work is in progress: a message alone cannot end the task. "
+                                           "Continue with tools, ask_user, or explicitly call task_complete.")
                 if resp.finish_reason in ("tool_calls", "function_call") and not turn.tool_calls:
                     raise LLMResponseError("The response announces tool calls but contains none.")
                 if not turn.tool_calls and not turn.text.strip():
@@ -392,21 +398,28 @@ class Agent:
                     continue
                 raise
 
-    def _response_repair_prompt(self, reason: str) -> str:
+    def _response_repair_prompt(self, reason: str, *, task_in_progress: bool = False) -> str:
         protocol = (
             'Return native tool_calls with complete JSON-object arguments for actions. '
-            'For a genuine answer requiring no actions, reply with normal text.'
             if self.protocol == "native" else
-            'Return ONE complete JSON object, e.g. {"actions":[{"tool":"screenshot","args":{}}]} '
-            '(shape example only; choose the actual tools and required arguments for this task), '
-            'or {"message":"your actual answer"}. No prose outside JSON.'
+            'For actions return ONE complete JSON object, e.g. {"actions":[{"tool":"screenshot","args":{}}]} '
+            '(shape example only; choose actual tools and required arguments). '
+        )
+        terminal = (
+            "Tool work has started. Do not end with plain text or a message object: continue with the next tool, "
+            "use ask_user, or call task_complete with a non-empty, truthful summary. "
+            "Use success=false if unable to complete or declining, rather than inventing success. "
+            if task_in_progress else
+            'For a complete answer needing no tools, return ONE JSON content object {"message":"your full answer"}, '
+            'not bare text. '
         )
         return (f"Your previous response was invalid: {reason[:500]}\n"
                 "It was discarded; NO actions from that response were executed. Send a COMPLETE replacement, "
-                "not a continuation of the broken output. Continue the user's current task from the screenshot "
-                "and tool results already provided; do NOT repeat earlier successful actions. "
-                "Do not echo screenshot coordinate metadata or return only reasoning. Keep the response concise "
-                "and in the original user's language. " + protocol)
+                "not a continuation. Do not simply quote or wrap the broken fragment as an answer/summary. "
+                "Reconsider the user's original task using the screenshot and tool results already provided; "
+                "do NOT repeat earlier successful actions. Do not echo screenshot metadata or return only reasoning. "
+                "Preserve any refusal or inability honestly. Keep the response concise and in the original user's language. "
+                + protocol + terminal)
 
     def _switch_to_json(self) -> None:
         self.protocol = "json"

@@ -75,13 +75,18 @@ TOOLS: list[ToolSpec] = [
     # ------------------------------------------------------------------ mouse
     ToolSpec(
         name="mouse_move",
-        description="Move the mouse pointer to (x, y) without clicking (useful for hover menus/tooltips).",
-        parameters=_obj(_XY, ["x", "y"]), category="mouse",
+        description=(
+            "Move the mouse pointer to (x, y) without clicking (useful for hover menus/tooltips). "
+            "No automatic screenshot is taken. Request screenshot only if you need to inspect a hover-induced UI change "
+            "or the user explicitly asks to verify the pointer. To click, call click directly with x/y instead."
+        ),
+        parameters=_obj(_XY, ["x", "y"]), screenshot_after=False, category="mouse",
     ),
     ToolSpec(
         name="click",
         description=(
-            "Click at (x, y) in screenshot coordinates. If x/y are omitted, click at the current pointer position. "
+            "Click at (x, y) in screenshot coordinates; movement to the target is automatic, so no separate mouse_move is needed. "
+            "If x/y are omitted, click at the current pointer position. "
             "Use button='right' for context menus, clicks=2 for double-click. Hold modifier keys with `modifiers`."
         ),
         parameters=_obj({

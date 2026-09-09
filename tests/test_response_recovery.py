@@ -106,7 +106,7 @@ def test_entire_malformed_batch_is_discarded_before_any_execution(config, backen
 @pytest.mark.parametrize("finish", ["length", "max_tokens", "max_output_tokens"])
 def test_truncated_but_parseable_tool_response_is_not_executed(config, backend, finish):
     partial = native_tool_message(("type_text", {"text": "must not execute a prefix"}))
-    llm = ScriptedLLM([response(partial, finish), "Please increase the output token limit."])
+    llm = ScriptedLLM([response(partial, finish), json.dumps({"message": "Please increase the output token limit."})])
     agent = Agent(config, backend, llm)
     assert agent.run("work").status == "answered"
     assert len(llm.calls) == 2 and not backend.typed
@@ -117,7 +117,7 @@ def test_truncated_but_parseable_tool_response_is_not_executed(config, backend, 
 def test_recovery_is_bounded_and_next_run_starts_with_a_fresh_budget(config, backend, budget):
     config.max_response_retries = budget
     errors, texts = [], []
-    llm = ScriptedLLM([ECHO] * (budget + 1) + ["A valid new answer."])
+    llm = ScriptedLLM([ECHO] * (budget + 1) + [json.dumps({"message": "A valid new answer."})])
     agent = Agent(config, backend, llm, AgentEvents(on_error=errors.append, on_assistant_text=texts.append))
     outcome = agent.run("first task", initial_screenshot=False)
     assert outcome.status == "error" and outcome.tool_calls == 0
@@ -155,7 +155,7 @@ def test_content_filter_and_authentication_failures_are_not_response_retries(con
                                        {"choices": [{"message": []}]}, {"choices": [{"message": "bad"}]}])
 def test_http_200_invalid_envelope_is_recoverable(monkeypatch, config, backend, envelope):
     client = LLMClient(config)
-    good = {"choices": [{"message": {"content": "good answer"}, "finish_reason": "stop"}]}
+    good = {"choices": [{"message": {"content": json.dumps({"message": "good answer"})}, "finish_reason": "stop"}]}
     post = Mock(side_effect=[Mock(status_code=200, json=Mock(return_value=envelope)),
                              Mock(status_code=200, json=Mock(return_value=good))])
     monkeypatch.setattr(client.session, "post", post)
@@ -165,7 +165,7 @@ def test_http_200_invalid_envelope_is_recoverable(monkeypatch, config, backend, 
 
 def test_http_200_non_json_is_recoverable(monkeypatch, config, backend):
     client = LLMClient(config)
-    good = {"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]}
+    good = {"choices": [{"message": {"content": json.dumps({"message": "OK"})}, "finish_reason": "stop"}]}
     post = Mock(side_effect=[Mock(status_code=200, json=Mock(side_effect=ValueError("bad JSON")), text="broken"),
                              Mock(status_code=200, json=Mock(return_value=good))])
     monkeypatch.setattr(client.session, "post", post)
@@ -208,7 +208,7 @@ def test_feature_negotiation_during_recovery_has_a_separate_budget(config, backe
     def unsupported(messages):
         setattr(llm, f"supports_{capability}", False)
         raise LLMError(f"{capability} unsupported", status=400)
-    final = '{"message":"fixed"}' if capability == "tools" else "fixed"
+    final = '{"message":"fixed"}'
     llm = ScriptedLLM([ECHO, unsupported, final])
     agent = Agent(config, backend, llm)
     assert agent.run("question").message == "fixed"

@@ -74,9 +74,9 @@ def plan(messages: list[dict[str, Any]]) -> tuple[str | None, list[tuple[str, di
             ("task_complete", {"summary": "روی صفحه یک دسکتاپ آبی با نوار وظیفه دیده می‌شود." + (" (image received)" if _has_images(messages) else " (no image)"), "success": True}),
         ]
     else:
-        return f"You said: {task.strip()[:80]}. I am a mock model; try 'open notepad', 'take a screenshot', 'ask me', or 'delete a file'.", []
+        return json.dumps({"message": f"You said: {task.strip()[:80]}. I am a mock model; try 'open notepad', 'take a screenshot', 'ask me', or 'delete a file'."}), []
     if rounds >= len(script):
-        return "Everything is done.", []
+        return '{"message":"Everything is done."}', []
     return None, [script[rounds]]
 
 

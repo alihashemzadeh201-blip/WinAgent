@@ -461,15 +461,8 @@ class WindowsBackend(DesktopBackend):
             raise BackendError("SetPhysicalCursorPos failed; pointer movement aborted.")
         # a zero-delta MOVE event makes hover states update in some apps
         self._send([self._mouse_input(MOUSEEVENTF_MOVE)])
-        self._require_pointer(x, y)
+        # Trust successful Win32 input calls; no extra cursor readback/calibration after moving.
         self._last_move = (x, y)
-
-    def _require_pointer(self, x: int, y: int) -> None:
-        actual = self.mouse_position()
-        if actual != (x, y):
-            raise BackendError(f"Pointer did not reach physical ({x},{y}); it is at {actual}. "
-                               "Refusing to continue with mismatched coordinates. The pointer may be clipped, the display may have changed, "
-                               "or another input source moved it. Take a new screenshot before trying again.")
 
     @staticmethod
     def _button_flags(button: str) -> tuple[int, int, int]:
@@ -491,7 +484,6 @@ class WindowsBackend(DesktopBackend):
         if x is not None and y is not None:
             self.mouse_move(x, y, duration=0.15)
             time.sleep(0.05)
-            self._require_pointer(int(x), int(y))  # fail closed if it moved during the hover delay
         down, up, data = self._button_flags(button)
         mods = [normalize_key(m) for m in (modifiers or [])]
         try:

@@ -14,9 +14,11 @@ exactly like a human sitting in front of the computer. The exact Windows version
 and installed programs of THIS machine are listed in the "Environment" section below – rely on them.
 
 ## How to work
-1. Understand the request. If it is a simple question or chat that needs no computer action, just answer in text.
-2. For tasks: look first (`screenshot`), then act step by step, verifying the result of each action with the
-   screenshot that comes back. Never assume an action worked – check.
+1. Understand the request. For a simple question/chat needing no tools, answer with a complete JSON content object:
+   {"message":"your full answer"}. The app shows the message as normal text. Do not send bare text fragments.
+2. For tasks: look first (`screenshot`), then act step by step. Check meaningful UI changes (clicks, typing,
+   scrolling) using the returned screenshot. Mere pointer movement needs no position-validation step:
+   a successful mouse_move result is sufficient for a movement-only task, unless the user explicitly asks to verify it.
 3. Prefer robust methods: `open_app` to launch programs, keyboard shortcuts (ctrl+s, alt+f4, win+d, ctrl+l in browsers)
    over pixel hunting, `run_command` (PowerShell) for file/system operations, `clipboard` + ctrl+v for long or
    non-Latin text, `type_text` for short text in focused fields.
@@ -29,14 +31,19 @@ and installed programs of THIS machine are listed in the "Environment" section b
    If display geometry changes, remaining actions may be skipped. Replan from the fresh full image; do not replay
    earlier successful actions or rescale old target coordinates onto a changed desktop layout.
    Zoomed regions are for inspection only; take a full screenshot again before clicking a target seen in a crop.
-   Click the centre of the target element. If a click misses, take a new screenshot and adjust; do not repeat blindly.
+   Click the centre of the target element directly with click(x, y); do not insert a move-and-check step first.
+   Use mouse_move for requested pointer movement or hover, not routine coordinate calibration. It does not take
+   an automatic screenshot. If hover opens a menu/tooltip you need to inspect, explicitly request screenshot.
+   If a click misses, take a new screenshot and adjust; do not repeat blindly.
 5. Wait for applications to load (`wait`) when the screen is not ready yet. If something unexpected appears
    (dialog, update prompt, login), handle it sensibly or ask the user.
 6. If you need information or a decision (credentials, which file, destructive action), use `ask_user`.
 7. Be economical: batch independent actions when safe (e.g. click then type), avoid needless screenshots, and stop
    when the goal is reached.
-8. When the task is finished (or impossible), call `task_complete` with a short summary. Do not call it before
-   verifying the final state.
+8. Once you start using tools, finish ONLY with `task_complete` and a non-empty, truthful summary. Use success=false
+   if unable to complete or declining the task. Verify the final task outcome before claiming success; for pure
+   pointer movement, the successful tool result is sufficient (no extra position check).
+   Plain text or {"message":"..."} cannot finish tool work. Continue with tools or use ask_user if you need input.
 
 ## Launching programs (read carefully)
 - ALWAYS use `open_app` to start a program. It understands friendly names ("paint", "calculator", "settings",
@@ -88,14 +95,30 @@ and installed programs of THIS machine are listed in the "Environment" section b
 - Return complete tool arguments. Reasoning alone or a partial JSON fragment is not a finished response.
 """
 
+NATIVE_PROTOCOL_PROMPT = """## Response protocol (IMPORTANT)
+Use native tool_calls for actions, with complete JSON-object arguments. Text accompanying tool_calls is commentary,
+not a completion signal. When answering without tools BEFORE any tool work, put ONE complete JSON object in content:
+{"message":"your complete answer"}
+Even in native mode, do NOT return bare prose as a final response. Once tools have been used, continue with the next
+tool, ask_user, or task_complete (success=true for verified completion; false if unable/declining). Never merely
+wrap a broken fragment as a message or summary: reconsider the user's original task and give a complete response.
+"""
+
+TASK_IN_PROGRESS_PROMPT = """## Current task state: tool work in progress
+Tools have already been used for this request. A no-tool message cannot end this task. Continue with the next tool,
+use ask_user for a needed answer, or explicitly call task_complete with a truthful, non-empty summary and success
+true/false. Do not repeat earlier successful actions. An inability/refusal is a valid outcome; report it honestly.
+"""
+
 JSON_PROTOCOL_PROMPT = """## Response protocol (IMPORTANT)
 This model connection does not use native function calling, so you MUST answer with a single JSON object and nothing
 else (no markdown fences, no prose outside the JSON):
 
 To perform actions:
-{"thought": "brief reasoning", "actions": [{"tool": "<tool name>", "args": {...}}, ...]}
+{"thought": "brief reasoning", "actions": [{"tool": "screenshot", "args": {}}]}
+This is a shape example; choose the actual tools and their complete required arguments for the task.
 
-To answer the user without actions (chat, questions, final report):
+For a complete chat answer BEFORE tool work starts:
 {"message": "<your reply to the user>"}
 
 You may include several actions in one turn only when they do not depend on each other's result. After each turn
@@ -180,6 +203,8 @@ def build_system_prompt(*, protocol: str, vision: bool, system_info: dict[str, A
     parts = [BASE_PROMPT, convention]
     if protocol == "json":
         parts.append(JSON_PROTOCOL_PROMPT + tools_markdown(coordinate_space) + "\n")
+    else:
+        parts.append(NATIVE_PROTOCOL_PROMPT)
     if not vision:
         parts.append(NO_VISION_PROMPT)
     if language and language != "auto":

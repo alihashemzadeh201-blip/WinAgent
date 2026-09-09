@@ -99,3 +99,25 @@ def test_connection_refused_is_reported_quickly():
     with pytest.raises(LLMError) as exc:
         LLMClient(cfg).chat([{"role": "user", "content": "hi"}])
     assert "Cannot connect" in str(exc.value)
+
+
+def test_arbitrary_fragments_do_not_end_tool_work_over_http(server, monkeypatch):
+    from tests import mock_server
+
+    srv, url, native = server
+    replies = [
+        (None, [("type_text", {"text": "written once"})]),
+        ("b sideways.", []),
+        ('{"message":"b sideways."}', []),
+        (None, [("task_complete", {"summary": "Recovered safely.", "success": True})]),
+    ]
+    monkeypatch.setattr(mock_server, "plan", lambda messages: replies.pop(0))
+    cfg, backend = make(url)
+    texts = []
+    agent = Agent(cfg, backend, llm=LLMClient(cfg), events=AgentEvents(on_assistant_text=texts.append))
+    result = agent.run("write the text exactly once")
+    assert result.status == "completed" and result.message == "Recovered safely."
+    assert result.steps == 2 and backend.typed == ["written once"]
+    assert texts == ["Recovered safely."]
+    assert len(srv.RequestHandlerClass.requests_log) == (4 if native else 5)  # optional native->JSON negotiation
+    assert "b sideways." not in str(agent.history)

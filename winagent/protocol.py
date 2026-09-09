@@ -6,7 +6,8 @@ Two wire formats are supported on top of the OpenAI-compatible
 ``native``
     Standard function calling: tool schemas go in the ``tools`` field, the
     model replies with ``tool_calls`` and we answer with ``role: tool``
-    messages.
+    messages. For no-tool answers the agent requires an explicit {"message": "..."}
+    content envelope; bare text is not a reliable completion signal.
 
 ``json``
     For models/back-ends without function calling.  The tools are described in
@@ -78,10 +79,13 @@ def _candidate_json_blobs(text: str) -> list[str]:
     text = text.strip()
     if not text:
         return []
-    cands: list[str] = []
+    # A complete outer document wins over examples/code fences inside string values. If an
+    # apparent container is truncated, never salvage an executable action from inside it.
+    cands: list[str] = [text]
+    if text.startswith(("{", "[")):
+        return cands
     for m in _FENCE_RE.finditer(text):
         cands.append(m.group(1).strip())
-    cands.append(text)
     # balanced-brace scan for the first top-level object
     depth = 0
     start = -1
@@ -121,7 +125,7 @@ def _candidate_json_blobs(text: str) -> list[str]:
 def _loads_lenient(blob: str) -> Any:
     try:
         return json.loads(blob)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         pass
     # Repair only tokens OUTSIDE strings. A trailing comma elsewhere must not rewrite typed text
     # such as "True, } None" or curly quotes inside a filename/document.
@@ -134,14 +138,14 @@ def _loads_lenient(blob: str) -> Any:
     fixed = tokens.sub(repair, blob)
     try:
         return json.loads(fixed)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         pass
     if "'" in blob:
         try:
             value = ast.literal_eval(blob)  # parse literals only; never eval() model output
             json.dumps(value, allow_nan=False)  # disallow non-JSON Python objects (sets, bytes, ...)
             return value
-        except (ValueError, SyntaxError, TypeError):
+        except (ValueError, SyntaxError, TypeError, RecursionError):
             pass
     raise ProtocolError("not JSON")
 
@@ -166,7 +170,7 @@ def parse_json_arguments(raw: Any) -> dict[str, Any]:
                     inner = json.loads(val)
                     if isinstance(inner, dict):
                         return inner
-                except json.JSONDecodeError:
+                except (ValueError, RecursionError):
                     pass
         raise ProtocolError("Tool arguments are not a complete JSON object.")
     raise ProtocolError(f"Unsupported argument type {type(raw).__name__}")
@@ -219,6 +223,8 @@ def _normalise_action(item: Any) -> ToolCall:
         missing = [k for k in spec.parameters.get("required", []) if k not in args]
         if missing:
             raise ProtocolError(f"Missing required arguments for {name}: {', '.join(missing)}.")
+    if name == "task_complete" and (not isinstance(args.get("summary"), str) or not args["summary"].strip()):
+        raise ProtocolError("task_complete requires a non-empty summary; an empty completion is not valid.")
     if name in ("click", "scroll") and ((args.get("x") is None) != (args.get("y") is None)):
         raise ProtocolError(f"{name} needs both x and y, or neither for the current pointer position.")
     call_id = item.get("id")
@@ -318,7 +324,7 @@ def parse_json_protocol(content: str, *, allow_plain_text: bool = False) -> Assi
     if allow_plain_text:
         try:
             data = json.loads(content)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             pass
         else:
             if data != {}:
@@ -326,8 +332,12 @@ def parse_json_protocol(content: str, *, allow_plain_text: bool = False) -> Assi
     return _bad_turn(content, "Expected a complete JSON object with actions or a non-empty message.")
 
 
-def parse_native_response(message: dict[str, Any]) -> AssistantTurn:
-    """Parse OpenAI content/tool calls atomically; malformed arguments never turn into an empty click."""
+def parse_native_response(message: dict[str, Any], *, allow_plain_text: bool = True) -> AssistantTurn:
+    """Parse OpenAI content/tool calls atomically; malformed arguments never turn into an empty click.
+
+    The agent passes allow_plain_text=False to require an explicit no-tool answer envelope. The
+    permissive option remains available to legacy callers that only need to read native messages.
+    """
     content = ""
     try:
         if not isinstance(message, dict):
@@ -361,7 +371,7 @@ def parse_native_response(message: dict[str, Any]) -> AssistantTurn:
             raise ProtocolError("Duplicate tool-call ids.")
         if parsed_calls:
             return AssistantTurn(text=content.strip(), thought=thought, tool_calls=parsed_calls, raw_content=content)
-        parsed = parse_json_protocol(content, allow_plain_text=True)
+        parsed = parse_json_protocol(content, allow_plain_text=allow_plain_text)
         parsed.thought = parsed.thought or thought
         return parsed
     except ProtocolError as exc:
@@ -400,7 +410,7 @@ def assistant_message_json(turn: AssistantTurn) -> dict[str, Any]:
         if turn.text:
             payload["message"] = turn.text
         return {"role": "assistant", "content": json.dumps(payload, ensure_ascii=False)}
-    return {"role": "assistant", "content": turn.text or turn.raw_content}
+    return {"role": "assistant", "content": json.dumps({"message": turn.text or turn.raw_content}, ensure_ascii=False)}
 
 
 def tool_results_message_json(results: list[tuple[ToolCall, str]]) -> dict[str, Any]:
