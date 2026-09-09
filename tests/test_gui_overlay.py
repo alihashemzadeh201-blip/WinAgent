@@ -420,3 +420,49 @@ def test_gui_keeps_working_after_bad_model_response(server, monkeypatch):
         assert "NO actions" in requests[1][-1]["content"]
     finally:
         win.close()
+
+
+def test_native_screenshot_setting_round_trips_and_disables_resize_width():
+    dlg = SettingsDialog(Config(screenshot_native_resolution=True, screenshot_max_width=1024))
+    assert dlg.shot_native.isChecked() and not dlg.shot_width.isEnabled()
+    cfg = dlg._collect()
+    assert cfg.screenshot_native_resolution and cfg.screenshot_max_width == 1024
+    dlg.shot_native.setChecked(False)
+    assert dlg.shot_width.isEnabled() and not dlg._collect().screenshot_native_resolution
+    dlg.close()
+
+
+def test_screenshot_ui_displays_native_mode_and_frame_details(demo_window):
+    demo_window.config.screenshot_native_resolution = True
+    demo_window.agent.config.screenshot_native_resolution = True
+    demo_window.agent.executor.config.screenshot_native_resolution = True
+    demo_window.manual_screenshot()
+    shot = demo_window._last_shot
+    assert shot.size == shot.raw_size
+    assert "1:1" in demo_window.shot_label.text()
+    assert shot.frame_id in demo_window.shot_label.toolTip()
+
+
+def test_coordinate_space_setting_round_trips_without_model_name_guessing():
+    cfg = Config(model="ag/gemini-pro-agent", coordinate_space="image_pixels")
+    dlg = SettingsDialog(cfg)
+    assert dlg.shot_space.currentData() == "image_pixels"
+    dlg.shot_space.setCurrentIndex(dlg.shot_space.findData("normalized_1000"))
+    assert dlg.shot_grid_spacing.suffix() == " /1000"
+    saved = dlg._collect()
+    assert saved.coordinate_space == "normalized_1000" and saved.model == cfg.model
+    assert not saved.screenshot_native_resolution  # unit changes do not silently raise image resolution/cost
+    restored = SettingsDialog(saved)
+    assert restored.shot_space.currentData() == "normalized_1000"
+    restored.shot_space.setCurrentIndex(restored.shot_space.findData("image_pixels"))
+    assert restored.shot_grid_spacing.suffix() == " px"
+    restored.close()
+    dlg.close()
+
+
+def test_screenshot_preview_identifies_normalized_units(demo_window):
+    demo_window.config.coordinate_space = "normalized_1000"
+    demo_window.agent.executor.config.coordinate_space = "normalized_1000"
+    demo_window.manual_screenshot()
+    assert "coords 0–1000" in demo_window.shot_label.text()
+    assert "normalized_1000" in demo_window.shot_label.toolTip()

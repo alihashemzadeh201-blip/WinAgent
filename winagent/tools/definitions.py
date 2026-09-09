@@ -10,8 +10,11 @@ JSON-schema for its arguments.  The same definitions are used for
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
+
+from ..config import COORDINATE_SPACES
 
 
 @dataclass(frozen=True)
@@ -40,8 +43,8 @@ def _obj(props: dict[str, Any], required: list[str] | None = None) -> dict[str, 
 
 
 _XY = {
-    "x": {"type": "integer", "description": "X coordinate in the coordinate space of the last screenshot."},
-    "y": {"type": "integer", "description": "Y coordinate in the coordinate space of the last screenshot."},
+    "x": {"type": "integer", "description": "X coordinate in pixels of the last FULL screenshot supplied before this response, not a crop or GUI preview."},
+    "y": {"type": "integer", "description": "Y coordinate in pixels of the last FULL screenshot supplied before this response, not a crop or GUI preview."},
 }
 
 TOOLS: list[ToolSpec] = [
@@ -57,7 +60,7 @@ TOOLS: list[ToolSpec] = [
         parameters=_obj({
             "region": {
                 "type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4,
-                "description": "Optional [left, top, right, bottom] in last-screenshot coordinates to capture a zoomed region.",
+                "description": "Optional [left, top, right, bottom] in last FULL screenshot coordinates to capture a zoomed region.",
             },
             "all_screens": {"type": "boolean", "description": "Capture all monitors instead of the primary one."},
             "grid": {"type": "boolean", "description": "Overlay a labelled coordinate grid (default from settings)."},
@@ -290,22 +293,49 @@ TOOLS: list[ToolSpec] = [
 TOOLS_BY_NAME: dict[str, ToolSpec] = {t.name: t for t in TOOLS}
 
 
-def openai_tool_schemas() -> list[dict[str, Any]]:
-    return [t.to_openai() for t in TOOLS]
+_POINTER_TOOLS = {"mouse_move", "click", "double_click", "right_click", "drag", "scroll"}
 
 
-def tools_markdown() -> str:
-    """Human/LLM readable description of all tools (for the JSON fallback protocol)."""
+def openai_tool_schemas(coordinate_space: str = "image_pixels") -> list[dict[str, Any]]:
+    """Return isolated schemas. Coordinate-mode changes must not mutate the shared tool registry."""
+    if coordinate_space not in COORDINATE_SPACES:
+        raise ValueError(f"Unknown coordinate space: {coordinate_space}")
+    schemas = [deepcopy(t.to_openai()) for t in TOOLS]
+    if coordinate_space == "normalized_1000":
+        for entry in schemas:
+            fn = entry["function"]
+            props = fn["parameters"].get("properties", {})
+            if fn["name"] in _POINTER_TOOLS:
+                fn["description"] += (" Positions use normalized 0-1000 units on BOTH axes of the last FULL image "
+                                      "provided before this response, NOT image pixels. Centre=(500,500).")
+                for key in ("x", "y", "x1", "y1", "x2", "y2"):
+                    if key in props:
+                        props[key] = {"type": "integer", "minimum": 0, "maximum": 1000,
+                                      "description": f"{key}: normalized 0-1000, NOT pixels; 0 is left/top, 1000 is the far edge."}
+            elif fn["name"] == "screenshot":
+                props["region"]["items"] = {"type": "integer", "minimum": 0, "maximum": 1000}
+                props["region"]["description"] = "[left, top, right, bottom] in normalized 0-1000 units of the last FULL image."
+                fn["description"] += " The region uses normalized 0-1000 units on both axes, not image pixels."
+            elif fn["name"] == "window_action":
+                fn["description"] += " Window positioning/sizing remains in physical desktop pixels, NOT normalized units."
+    return schemas
+
+
+def tools_markdown(coordinate_space: str = "image_pixels") -> str:
+    """Human/LLM description using the SAME coordinate contract as the native function schemas."""
     lines: list[str] = []
-    for t in TOOLS:
-        props = t.parameters.get("properties", {})
-        required = set(t.parameters.get("required", []))
+    for entry in openai_tool_schemas(coordinate_space):
+        fn = entry["function"]
+        props = fn["parameters"].get("properties", {})
+        required = set(fn["parameters"].get("required", []))
         arg_desc = []
         for name, schema in props.items():
             typ = schema.get("type", "any")
             if "enum" in schema:
                 typ = "|".join(map(str, schema["enum"]))
+            if "minimum" in schema and "maximum" in schema:
+                typ += f"[{schema['minimum']}..{schema['maximum']}]"
             flag = "" if name in required else "?"
             arg_desc.append(f"{name}{flag}: {typ}")
-        lines.append(f"- **{t.name}**({', '.join(arg_desc)}) — {t.description}")
+        lines.append(f"- **{fn['name']}**({', '.join(arg_desc)}) — {fn['description']}")
     return "\n".join(lines)

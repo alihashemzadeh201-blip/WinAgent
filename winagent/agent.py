@@ -81,6 +81,7 @@ class Agent:
         # ``guard`` keeps the host UI out of screenshots / from under the mouse (the GUI passes a QtScreenGuard)
         self.executor = ToolExecutor(backend, config, confirm=self._confirm, stop_event=self.stop_event, guard=guard)
         self.history: list[dict[str, Any]] = []   # chat history WITHOUT the system prompt
+        self._model_frame: Optional[Screenshot] = None  # last FULL image actually included in a model request
         self._image_slots: list[int] = []          # indexes of history messages that carry images
         self.protocol = self._initial_protocol()
         self.vision = bool(config.vision_enabled)
@@ -101,6 +102,7 @@ class Agent:
             self.history.clear()
             self._image_slots.clear()
             self.executor.last_screenshot = None
+            self._model_frame = None
 
     def _confirm(self, call: ToolCall, reason: str) -> bool:
         try:
@@ -110,17 +112,18 @@ class Agent:
             return False
 
     # ------------------------------------------------------------ messaging
-    def _system_message(self) -> dict[str, Any]:
+    def _system_message(self, coordinate_space: Optional[str] = None) -> dict[str, Any]:
         try:
             info = self.backend.system_info()
         except Exception as exc:  # pragma: no cover
             info = {"note": f"system info unavailable: {exc}"}
         prompt = build_system_prompt(protocol=self.protocol, vision=self.vision, system_info=info,
-                                     language=self.config.response_language, extra=self.config.extra_system_prompt)
+                                     language=self.config.response_language, extra=self.config.extra_system_prompt,
+                                     coordinate_space=coordinate_space or self.config.coordinate_space)
         return {"role": "system", "content": prompt}
 
-    def _messages(self) -> list[dict[str, Any]]:
-        return [self._system_message(), *self.history]
+    def _messages(self, coordinate_space: Optional[str] = None) -> list[dict[str, Any]]:
+        return [self._system_message(coordinate_space), *self.history]
 
     def _append(self, msg: dict[str, Any], has_image: bool = False) -> None:
         self.history.append(msg)
@@ -149,7 +152,10 @@ class Agent:
 
     def _user_message(self, text: str, shot: Optional[Screenshot] = None) -> dict[str, Any]:
         if shot is not None and self.vision:
-            return {"role": "user", "content": [text_part(text), image_part(shot.data_url())]}
+            image = image_part(shot.data_url())
+            if not shot.is_region:
+                self._model_frame = shot
+            return {"role": "user", "content": [text_part(text), image]}
         return {"role": "user", "content": text}
 
     # ------------------------------------------------------------------ run
@@ -190,7 +196,10 @@ class Agent:
                 self.events.on_step(steps, self.config.max_steps)
                 self.events.on_status(f"Thinking… (step {steps}/{self.config.max_steps})")
 
-                turn = self._call_model()
+                # Snapshot BEFORE HTTP/confirmation callbacks: no later capture may change this response's coordinates.
+                frame = self._model_frame if self.vision else self.executor.last_screenshot
+                coordinate_space = frame.coordinate_space if frame else self.config.coordinate_space
+                turn = self._call_model(coordinate_space=coordinate_space)
                 if turn.thought:
                     self.events.on_thought(turn.thought)
 
@@ -209,9 +218,14 @@ class Agent:
                 results: list[ToolResult] = []
                 finished: Optional[ToolResult] = None
                 waiting: Optional[ToolResult] = None
+                refresh_required = False
                 for call in turn.tool_calls:
                     if self.stop_event.is_set():
                         results.append(ToolResult(call, False, error="Stopped by user."))
+                        continue
+                    if refresh_required:
+                        results.append(ToolResult(call, False, error="Skipped: display geometry changed. "
+                                                  "This action was NOT executed. Replan from the new full screenshot."))
                         continue
                     if finished is not None or waiting is not None:
                         results.append(ToolResult(call, False, error="Skipped: a previous tool call ended the turn."))
@@ -219,7 +233,19 @@ class Agent:
                     n_calls += 1
                     self.events.on_tool_start(call)
                     self.events.on_status(f"Running {call.name}…")
-                    result = self.executor.execute(call)
+                    try:
+                        result = self.executor.execute(call, coordinate_frame=frame, coordinate_space=coordinate_space)
+                    except EmergencyStop as exc:
+                        self.stop()
+                        result = ToolResult(call, False, error=str(exc) or "Emergency stop.")
+                    if result.needs_new_screenshot:
+                        refresh_required = True
+                        self.events.on_status("Display changed – refreshing screenshot before any more actions.")
+                        if not self.stop_event.is_set():
+                            try:
+                                result.screenshot = self.executor.take_screenshot(all_screens=frame.all_screens if frame else False)
+                            except Exception as exc:
+                                result.data["screenshot_error"] = str(exc)
                     self.events.on_tool_end(result)
                     if result.screenshot is not None:
                         self.events.on_screenshot(result.screenshot)
@@ -282,6 +308,8 @@ class Agent:
         for r in results:
             if r.screenshot is not None:
                 latest_shot = r.screenshot
+        if latest_shot is not None and self.vision and not latest_shot.is_region:
+            self._model_frame = latest_shot
         if self.protocol == "native":
             for r in results:
                 self._append(tool_result_message_native(r.call, r.to_text()))
@@ -296,25 +324,28 @@ class Agent:
             else:
                 self._append(msg)
 
-    def _call_model(self) -> AssistantTurn:
+    def _call_model(self, *, coordinate_space: Optional[str] = None) -> AssistantTurn:
         """Negotiate capabilities and recover bad output BEFORE committing any tool calls to history.
 
         Transport retries live in LLMClient. Response retries have a separate, finite budget; the
         repair prompt is request-local so invalid native calls never leave orphan tool messages.
         Previously successful rounds are preserved and are never re-executed by this retry loop.
         """
+        coordinate_space = coordinate_space or self.config.coordinate_space
         retries = 0
         repair_reason = ""
         while True:
             if self.stop_event.is_set():
                 raise LLMCancelled("stopped")
-            messages = self._messages()
+            messages = self._messages(coordinate_space)
             if repair_reason:
                 messages.append({"role": "user", "content": self._response_repair_prompt(repair_reason)})
             try:
-                resp = self.llm.chat(messages, tools=openai_tool_schemas()) if self.protocol == "native" else self.llm.chat(messages)
+                resp = self.llm.chat(messages, tools=openai_tool_schemas(coordinate_space)) if self.protocol == "native" else self.llm.chat(messages)
                 if self.stop_event.is_set():
                     raise LLMCancelled("stopped")
+                log.info("Model response: requested=%s reported=%s coordinate_space=%s finish=%s",
+                         self.config.model, resp.model, coordinate_space, resp.finish_reason)
                 if not isinstance(resp.message, dict):
                     raise LLMResponseError("Assistant message must be an object.")
                 if resp.finish_reason == "content_filter":

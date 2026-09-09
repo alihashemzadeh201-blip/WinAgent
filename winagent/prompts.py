@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .config import COORDINATE_SPACES
 from .tools.definitions import tools_markdown
 
 BASE_PROMPT = """You are WinAgent, an autonomous computer-use assistant that operates a Microsoft Windows PC on behalf of the user.
@@ -19,9 +20,14 @@ and installed programs of THIS machine are listed in the "Environment" section b
 3. Prefer robust methods: `open_app` to launch programs, keyboard shortcuts (ctrl+s, alt+f4, win+d, ctrl+l in browsers)
    over pixel hunting, `run_command` (PowerShell) for file/system operations, `clipboard` + ctrl+v for long or
    non-Latin text, `type_text` for short text in focused fields.
-4. Coordinates: all x/y values refer to the LAST FULL screenshot you received (its size is stated in each result).
-   Use image pixels, not Windows logical/DPI-scaled coordinates or normalised percentages. The executor already
-   handles scaling and monitor origin: do NOT apply another DPI factor or add/subtract title-bar/taskbar offsets.
+4. Coordinates: pointer positions and screenshot regions refer to the LAST FULL screenshot you received.
+   Use the explicit Coordinate convention section below. Never mix image pixels, normalized units and
+   Windows logical pixels. The executor handles conversion and monitor origin: do NOT apply another DPI factor
+   or add/subtract title-bar/taskbar offsets.
+   Every coordinate in one response uses the last FULL image you received BEFORE that response. A screenshot
+   requested in the same batch is a future observation, not a new coordinate frame for that batch.
+   If display geometry changes, remaining actions may be skipped. Replan from the fresh full image; do not replay
+   earlier successful actions or rescale old target coordinates onto a changed desktop layout.
    Zoomed regions are for inspection only; take a full screenshot again before clicking a target seen in a crop.
    Click the centre of the target element. If a click misses, take a new screenshot and adjust; do not repeat blindly.
 5. Wait for applications to load (`wait`) when the screen is not ready yet. If something unexpected appears
@@ -155,10 +161,25 @@ def environment_section(system_info: dict[str, Any]) -> str:
 
 
 def build_system_prompt(*, protocol: str, vision: bool, system_info: dict[str, Any], language: str = "auto",
-                        extra: str = "") -> str:
-    parts = [BASE_PROMPT]
+                        extra: str = "", coordinate_space: str = "image_pixels") -> str:
+    if coordinate_space not in COORDINATE_SPACES:
+        raise ValueError(f"Unknown coordinate space: {coordinate_space}")
+    if coordinate_space == "normalized_1000":
+        convention = ("## Coordinate convention: normalized_1000\n"
+                      "All pointer positions (x,y,x1,y1,x2,y2) and screenshot region edges use normalized 0-1000 units "
+                      "on BOTH axes. They are NOT image pixels and NOT 0-100 percentages. The centre is (500,500) "
+                      "regardless of the screenshot dimensions. Use the normalized grid labels on the image. "
+                      "1000 denotes the far edge (last pixel for a pointer target). The executor converts once to "
+                      "physical pixels; do not perform that conversion yourself. Physical window rectangles and "
+                      "window_action positioning/sizing are still physical pixels.\n")
+    else:
+        convention = ("## Coordinate convention: image_pixels\n"
+                      "All pointer positions and screenshot regions use actual pixels of the last FULL image "
+                      "received before this response. Do NOT return normalized 0-1000 units, percentages or "
+                      "Windows logical pixels. The image dimensions are in its description.\n")
+    parts = [BASE_PROMPT, convention]
     if protocol == "json":
-        parts.append(JSON_PROTOCOL_PROMPT + tools_markdown() + "\n")
+        parts.append(JSON_PROTOCOL_PROMPT + tools_markdown(coordinate_space) + "\n")
     if not vision:
         parts.append(NO_VISION_PROMPT)
     if language and language != "auto":

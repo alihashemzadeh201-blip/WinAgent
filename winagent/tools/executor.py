@@ -21,8 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from ..backends.base import BackendError, DesktopBackend, EmergencyStop
-from ..config import Config
+from ..backends.base import BackendError, DesktopBackend, EmergencyStop, ScreenGeometry
+from ..config import COORDINATE_SPACES, Config
 from ..keys import parse_key_combo
 from ..protocol import ToolCall
 from ..screenshot import Screenshot, prepare_screenshot
@@ -30,6 +30,15 @@ from ..screenguard import ScreenGuard, rect_from_points
 from .definitions import TOOLS_BY_NAME
 
 log = logging.getLogger(__name__)
+_CURRENT_FRAME = object()
+
+
+class CoordinateFrameChanged(BackendError):
+    """Screen geometry no longer matches the image used to choose coordinates."""
+
+
+def _bounds(geometry: ScreenGeometry) -> tuple[int, int, int, int]:
+    return geometry.left, geometry.top, geometry.width, geometry.height
 
 # Patterns that mark a shell command as destructive -> confirmation required.
 DANGEROUS_COMMAND_PATTERNS = [
@@ -57,12 +66,15 @@ class ToolResult:
     task_complete: bool = False
     ask_user: Optional[dict[str, Any]] = None
     denied: bool = False
+    needs_new_screenshot: bool = False
 
     def to_text(self, include_screenshot_note: bool = True) -> str:
         payload: dict[str, Any] = {"ok": self.ok}
         if self.error:
             payload["error"] = self.error
         payload.update(self.data)
+        if self.needs_new_screenshot:
+            payload["needs_new_screenshot"] = True
         if self.screenshot is not None and include_screenshot_note:
             payload["screenshot"] = self.screenshot.describe()
         return json.dumps(payload, ensure_ascii=False, default=str)
@@ -94,18 +106,69 @@ class ToolExecutor:
         self.guard: ScreenGuard = guard or ScreenGuard()
         self.last_screenshot: Optional[Screenshot] = None
         self.screenshot_count = 0
+        self._bound_frame = _CURRENT_FRAME
+        self._bound_coordinate_space: Optional[str] = None
+        self._coordinate_mappings: list[dict[str, Any]] = []
+
+    @property
+    def input_screenshot(self) -> Optional[Screenshot]:
+        # An explicit None is important: an unseen capture must not invent an input frame mid-batch.
+        return self.last_screenshot if self._bound_frame is _CURRENT_FRAME else self._bound_frame
+
+    @property
+    def input_coordinate_space(self) -> str:
+        frame = self.input_screenshot
+        space = frame.coordinate_space if frame is not None else (self._bound_coordinate_space or self.config.coordinate_space)
+        if space not in COORDINATE_SPACES:
+            raise BackendError(f"Invalid coordinate_space: {space}. Choose an explicit supported convention.")
+        return space
+
+    def _model_coord_int(self, value: Any, name: str) -> int:
+        if self.input_coordinate_space != "normalized_1000":
+            return _to_int(value, name)
+        # Do not quietly turn a 0-1 coordinate (0.5) or an explicit "500px" into normalized units.
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a whole normalized 0-1000 value, without a px suffix.") from exc
+        if isinstance(value, bool) or not number.is_integer():
+            raise ValueError(f"{name} must be a whole normalized 0-1000 value, not fractional/0-1 coordinates.")
+        return int(number)
+
+    def _check_frame(self) -> None:
+        frame = self.input_screenshot
+        if frame is None or frame.desktop_bounds is None:
+            return
+        current = _bounds(self.backend.screen_geometry(all_screens=frame.all_screens))
+        if current != frame.desktop_bounds:
+            raise CoordinateFrameChanged(
+                f"Display geometry changed since frame {frame.frame_id}: {frame.desktop_bounds} -> {current}. "
+                "No pointer input was sent. Take a fresh full screenshot and choose new coordinates; "
+                "do not rescale coordinates from the old screen layout.")
+
+    @contextlib.contextmanager
+    def _pointer_guard(self, **kwargs):
+        with self.guard.shield(**kwargs):
+            # The GUI/desktop may change while the guard hides windows. Check at the input boundary.
+            self._check_stop()
+            self._check_frame()
+            yield
 
     # ------------------------------------------------------------ screenshot
     def take_screenshot(self, *, region: Optional[list[int]] = None, all_screens: bool = False,
                         grid: Optional[bool] = None) -> Screenshot:
         cfg = self.config
-        geometry = self.backend.screen_geometry(all_screens=all_screens)
+        frame = self.input_screenshot
+        capture_all = frame.all_screens if region and frame is not None else all_screens
+        geometry = self.backend.screen_geometry(all_screens=capture_all)
+        before = _bounds(geometry)
         phys_region = None
         if region:
-            if self.last_screenshot is None:
+            if frame is None:
                 raise BackendError("Take a full screenshot before requesting a region.")
-            l, t = self.last_screenshot.to_physical(region[0], region[1])
-            r, b = self.last_screenshot.to_physical(region[2], region[3])
+            self._check_frame()
+            l, t = frame.model_to_physical(region[0], region[1], edge=True)
+            r, b = frame.model_to_physical(region[2], region[3], edge=True)
             l, r = sorted((l, r))
             t, b = sorted((t, b))
             if r - l < 8 or b - t < 8:
@@ -114,7 +177,15 @@ class ToolExecutor:
         # a region is expressed in absolute coordinates -> grab the whole virtual screen and crop
         capture_rect = phys_region or (geometry.left, geometry.top, geometry.left + geometry.width, geometry.top + geometry.height)
         with self.guard.shield(rect=capture_rect, for_capture=True):   # our own GUI must not appear in the picture
-            raw = self.backend.capture(all_screens=all_screens or phys_region is not None, region=phys_region)
+            raw = self.backend.capture(all_screens=capture_all or phys_region is not None, region=phys_region)
+            after = _bounds(self.backend.screen_geometry(all_screens=capture_all))
+        expected_size = ((phys_region[2] - phys_region[0], phys_region[3] - phys_region[1])
+                         if phys_region else (geometry.width, geometry.height))
+        if before != after or raw.size != expected_size:
+            raise CoordinateFrameChanged(
+                f"Unstable or inconsistent screen capture: before={before}, after={after}, "
+                f"expected pixels={expected_size}, captured pixels={raw.size}. "
+                "Take a new full screenshot after the display settles; do not guess a scale or offset.")
         cursor = None
         if cfg.screenshot_show_cursor:
             try:
@@ -122,37 +193,51 @@ class ToolExecutor:
             except Exception:
                 cursor = None
         if phys_region:
-            from ..backends.base import ScreenGeometry
-
             geometry = ScreenGeometry(phys_region[0], phys_region[1], phys_region[2] - phys_region[0], phys_region[3] - phys_region[1])
-            max_width = cfg.screenshot_max_width  # regions are zoomed: never downscale below raw
-        else:
-            max_width = cfg.screenshot_max_width
+        max_width = None if cfg.screenshot_native_resolution else cfg.screenshot_max_width
         shot = prepare_screenshot(
             raw, geometry=geometry, max_width=max_width,
             grid=cfg.screenshot_grid if grid is None else bool(grid),
             grid_spacing=cfg.screenshot_grid_spacing, cursor=cursor,
-            fmt=cfg.screenshot_format, quality=cfg.screenshot_jpeg_quality,
+            fmt=cfg.screenshot_format, quality=cfg.screenshot_jpeg_quality, coordinate_space=cfg.coordinate_space,
         )
         shot.is_region = phys_region is not None
+        shot.all_screens = capture_all
+        shot.desktop_bounds = before
         if phys_region is None:
             self.last_screenshot = shot  # regions don't replace the coordinate frame
         self.screenshot_count += 1
+        log.info("Captured frame=%s coordinate_space=%s scope=%s origin=%s physical=%s image=%s scale=(%.6f,%.6f)",
+                 shot.frame_id, shot.coordinate_space, "region" if shot.is_region else ("all monitors" if shot.all_screens else "primary"),
+                 shot.origin, shot.raw_size, shot.size, shot.scale_x, shot.scale_y)
         return shot
 
     # --------------------------------------------------------------- helpers
     def _phys(self, x: Any, y: Any) -> tuple[int, int]:
-        xi, yi = _to_int(x, "x"), _to_int(y, "y")
-        if self.last_screenshot is None:
-            # no screenshot yet: treat as physical coordinates
-            return xi, yi
-        w, h = self.last_screenshot.size
-        if not (0 <= xi < w and 0 <= yi < h):
-            raise BackendError(f"Coordinates ({xi},{yi}) are outside the screenshot ({w}x{h}). "
-                               "Use coordinates from the last full screenshot.")
-        px, py = self.last_screenshot.to_physical(xi, yi)
-        log.debug("Pointer mapping: image=(%s,%s) image_size=%s raw_size=%s origin=%s -> physical=(%s,%s)",
-                  xi, yi, self.last_screenshot.size, self.last_screenshot.raw_size, self.last_screenshot.origin, px, py)
+        xi, yi = self._model_coord_int(x, "x"), self._model_coord_int(y, "y")
+        frame = self.input_screenshot
+        if frame is None:
+            if self.input_coordinate_space == "normalized_1000":
+                raise CoordinateFrameChanged("Normalized coordinates require a full screenshot with known dimensions. "
+                                             "No pointer input was sent; take a full screenshot first.")
+            return xi, yi  # explicitly physical coordinates without an image, never guess a normalization factor
+        self._check_frame()
+        w, h = frame.size
+        max_x, max_y = frame.model_limits
+        if not (0 <= xi <= max_x and 0 <= yi <= max_y):
+            raise BackendError(f"Coordinates ({xi},{yi}) are outside {frame.coordinate_space} bounds "
+                               f"(x=0..{max_x}, y=0..{max_y}) for screenshot {w}x{h}. "
+                               "Use the declared coordinate space; do not mix pixels and normalized units.")
+        px, py = frame.model_to_physical(xi, yi)
+        image_point = [xi, yi]
+        if frame.coordinate_space == "normalized_1000":
+            ix, iy = frame.to_image(px, py)
+            image_point = [min(w - 1, max(0, ix)), min(h - 1, max(0, iy))]
+        mapping = {"frame_id": frame.frame_id, "coordinate_space": frame.coordinate_space, "model_point": [xi, yi],
+                   "image_point": image_point, "image_size": list(frame.size),
+                   "capture_size": list(frame.raw_size), "origin": list(frame.origin), "physical_target": [px, py]}
+        self._coordinate_mappings.append(mapping)
+        log.info("Pointer mapping: %s", mapping)
         return px, py
 
     def _pointer(self) -> Optional[tuple[int, int]]:
@@ -201,10 +286,13 @@ class ToolExecutor:
             raise BackendError(f"No window matching title={title!r} hwnd={hwnd!r}. Open windows: {titles}")
         return win
 
-    def _window_dict(self, w) -> dict[str, Any]:
+    def _window_dict(self, w, *, frame=_CURRENT_FRAME) -> dict[str, Any]:
         d = w.to_dict()
-        if self.last_screenshot is not None:
-            d["screenshot_rect"] = [*self.last_screenshot.to_image(w.left, w.top), *self.last_screenshot.to_image(w.right, w.bottom)]
+        frame = self.input_screenshot if frame is _CURRENT_FRAME else frame
+        if frame is not None:
+            d["screenshot_rect"] = [*frame.to_model(w.left, w.top), *frame.to_model(w.right, w.bottom)]
+            d["screenshot_frame_id"] = frame.frame_id
+            d["coordinate_space"] = frame.coordinate_space
         return d
 
     def _require_confirm(self, call: ToolCall, reason: str) -> bool:
@@ -215,7 +303,25 @@ class ToolExecutor:
         return bool(self.confirm(call, reason))
 
     # ---------------------------------------------------------------- execute
-    def execute(self, call: ToolCall) -> ToolResult:
+    def execute(self, call: ToolCall, *, coordinate_frame=_CURRENT_FRAME, coordinate_space: Optional[str] = None) -> ToolResult:
+        """Bind every call in a model response to the image supplied BEFORE that response.
+
+        Captures still update last_screenshot for output, but can never reinterpret this call's input.
+        Direct users of the executor retain the default of using the latest full capture.
+        """
+        previous, mappings, previous_space = self._bound_frame, self._coordinate_mappings, self._bound_coordinate_space
+        self._bound_coordinate_space = coordinate_space or self.config.coordinate_space
+        self._bound_frame = self.last_screenshot if coordinate_frame is _CURRENT_FRAME else coordinate_frame
+        self._coordinate_mappings = []
+        try:
+            result = self._execute(call)
+            if self._coordinate_mappings:
+                result.data["coordinate_mapping"] = list(self._coordinate_mappings)
+            return result
+        finally:
+            self._bound_frame, self._coordinate_mappings, self._bound_coordinate_space = previous, mappings, previous_space
+
+    def _execute(self, call: ToolCall) -> ToolResult:
         start = time.time()
         spec = TOOLS_BY_NAME.get(call.name)
         if spec is None:
@@ -229,19 +335,36 @@ class ToolExecutor:
                                   duration=time.time() - start)
         try:
             self._check_stop()
+            args = call.arguments or {}
+            declares_space = args.get("coordinate_space")
+            if (declares_space is not None and (spec.category == "mouse" or (call.name == "screenshot" and args.get("region")))
+                    and declares_space != self.input_coordinate_space):
+                raise BackendError(f"The tool arguments declare {declares_space!r} coordinates, but this response uses "
+                                   f"{self.input_coordinate_space}. No input was sent; follow the declared tool schema.")
             handler = getattr(self, f"_t_{call.name}")
             with self.guard.scope():   # hide our GUI at most once per tool call, restore when the call is over
                 result = handler(call, call.arguments or {})
+                if self._coordinate_mappings and result.ok:
+                    result.data["pointer_after_action"] = self._pointer()
+                    log.info("Pointer after action: frame=%s physical=%s", self.input_screenshot.frame_id,
+                             result.data["pointer_after_action"])
                 # automatic screenshot after UI actions
                 if (spec.screenshot_after and self.config.auto_screenshot_after_action and result.ok
                         and result.screenshot is None and not result.task_complete and result.ask_user is None):
                     try:
                         time.sleep(max(0.0, self.config.action_delay))
-                        result.screenshot = self.take_screenshot()
+                        frame = self.input_screenshot
+                        result.screenshot = self.take_screenshot(all_screens=frame.all_screens if frame else False)
+                    except CoordinateFrameChanged as exc:
+                        # The action already succeeded. Keep ok=True; don't invite its replay just because capture failed.
+                        result.data["screenshot_error"] = str(exc)
+                        result.needs_new_screenshot = True
                     except Exception as exc:  # pragma: no cover
                         result.data["screenshot_error"] = str(exc)
         except EmergencyStop:
             raise
+        except CoordinateFrameChanged as exc:
+            result = ToolResult(call, False, error=str(exc), needs_new_screenshot=True)
         except BackendError as exc:
             result = ToolResult(call, False, error=str(exc))
         except (ValueError, TypeError, KeyError) as exc:
@@ -262,14 +385,17 @@ class ToolExecutor:
         if region is not None:
             if not (isinstance(region, (list, tuple)) and len(region) == 4):
                 raise ValueError("region must be [left, top, right, bottom]")
-            region = [_to_int(v, "region") for v in region]
+            region = [self._model_coord_int(v, "region") for v in region]
         shot = self.take_screenshot(region=region, all_screens=bool(a.get("all_screens", False)), grid=a.get("grid"))
         data: dict[str, Any] = {"message": "Screenshot captured."}
+        frame = self.input_screenshot if shot.is_region else shot
         try:
             win = self.backend.active_window()
             if win:
-                data["active_window"] = self._window_dict(win)
-            data["mouse"] = list(self.last_screenshot.to_image(*self.backend.mouse_position())) if self.last_screenshot else None
+                data["active_window"] = self._window_dict(win, frame=frame)
+            data["mouse"] = list(frame.to_model(*self.backend.mouse_position())) if frame else None
+            data["screenshot_frame_id"] = frame.frame_id if frame else None
+            data["coordinate_space"] = frame.coordinate_space if frame else self.input_coordinate_space
         except Exception:
             pass
         if region is not None:
@@ -280,15 +406,17 @@ class ToolExecutor:
         return ToolResult(call, True, data, screenshot=shot)
 
     def _t_get_screen_info(self, call: ToolCall, a: dict[str, Any]) -> ToolResult:
+        frame = self.input_screenshot
         info = self.backend.system_info()
         active = self.backend.active_window()
         windows = [self._window_dict(w) for w in self.backend.list_windows()[:40]]
         mouse = self.backend.mouse_position()
         data = {
             "system": info,
+            "coordinate_space": self.input_coordinate_space,
             "mouse_physical": list(mouse),
-            "mouse_screenshot": list(self.last_screenshot.to_image(*mouse)) if self.last_screenshot else None,
-            "screenshot_frame": self.last_screenshot.describe() if self.last_screenshot else "no screenshot taken yet",
+            "mouse_screenshot": list(frame.to_model(*mouse)) if frame else None,
+            "screenshot_frame": frame.describe() if frame else "no screenshot taken yet",
             "active_window": self._window_dict(active) if active else None,
             "windows": windows,
         }
@@ -297,7 +425,7 @@ class ToolExecutor:
     # ----------------------------------------------------------------- mouse
     def _t_mouse_move(self, call: ToolCall, a: dict[str, Any]) -> ToolResult:
         x, y = self._phys(a.get("x"), a.get("y"))
-        with self.guard.shield(point=(x, y)):
+        with self._pointer_guard(point=(x, y)):
             self.backend.mouse_move(x, y, duration=0.25)
         return ToolResult(call, True, {"message": f"Mouse moved to physical ({x},{y})."})
 
@@ -309,12 +437,12 @@ class ToolExecutor:
         if isinstance(mods, str):
             mods = parse_key_combo(mods)
         if a.get("x") is None or a.get("y") is None:
-            with self.guard.shield(point=self._pointer()):
+            with self._pointer_guard(point=self._pointer()):
                 self.backend.mouse_click(None, None, button=button, clicks=clicks, modifiers=list(mods))
             where = "at current pointer position"
         else:
             x, y = self._phys(a.get("x"), a.get("y"))
-            with self.guard.shield(point=(x, y)):   # never click on our own window
+            with self._pointer_guard(point=(x, y)):   # never click on our own window
                 self.backend.mouse_click(x, y, button=button, clicks=clicks, modifiers=list(mods))
             where = f"at physical ({x},{y})"
         kind = {1: "Clicked", 2: "Double-clicked", 3: "Triple-clicked"}[clicks]
@@ -330,7 +458,7 @@ class ToolExecutor:
         x1, y1 = self._phys(a.get("x1"), a.get("y1"))
         x2, y2 = self._phys(a.get("x2"), a.get("y2"))
         duration = float(a.get("duration") or 0.5)
-        with self.guard.shield(rect=rect_from_points((x1, y1), (x2, y2), margin=4)):
+        with self._pointer_guard(rect=rect_from_points((x1, y1), (x2, y2), margin=4)):
             self.backend.mouse_drag(x1, y1, x2, y2, button=str(a.get("button") or "left"), duration=min(max(duration, 0.1), 5.0))
         return ToolResult(call, True, {"message": f"Dragged from ({x1},{y1}) to ({x2},{y2}) physical px."})
 
@@ -341,7 +469,7 @@ class ToolExecutor:
         x = y = None
         if a.get("x") is not None and a.get("y") is not None:
             x, y = self._phys(a.get("x"), a.get("y"))
-        with self.guard.shield(point=(x, y) if x is not None else self._pointer()):
+        with self._pointer_guard(point=(x, y) if x is not None else self._pointer()):
             if direction.startswith("h"):
                 self.backend.mouse_scroll(x, y, dx=amount, dy=0)
             else:
@@ -516,12 +644,15 @@ class ToolExecutor:
         win = self._find_window(a)
         limit = min(max(_to_int(a.get("limit", 150), "limit"), 1), 500)
         controls = self.backend.window_controls(win.hwnd, limit=limit)
+        frame = self.input_screenshot
         out = []
         for c in controls:
             d = c.to_dict()
-            if self.last_screenshot is not None:
+            if frame is not None:
                 cx, cy = (c.left + c.right) // 2, (c.top + c.bottom) // 2
-                d["screenshot_center"] = list(self.last_screenshot.to_image(cx, cy))
+                d["screenshot_center"] = list(frame.to_model(cx, cy))
+                d["screenshot_frame_id"] = frame.frame_id
+                d["coordinate_space"] = frame.coordinate_space
             out.append(d)
         return ToolResult(call, True, {"window": self._window_dict(win), "count": len(out), "controls": out})
 

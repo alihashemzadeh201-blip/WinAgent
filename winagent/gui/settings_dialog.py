@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import BACKENDS, GUI_MODES, OVERLAY_CORNERS, SCREENSHOT_FORMATS, TOOL_PROTOCOLS, Config
+from ..config import BACKENDS, COORDINATE_SPACES, GUI_MODES, OVERLAY_CORNERS, SCREENSHOT_FORMATS, TOOL_PROTOCOLS, Config
 from ..llm import LLMClient, LLMError
 
 GUI_MODE_LABELS = {
@@ -196,17 +196,33 @@ class SettingsDialog(QDialog):
         # --- Screenshots -----------------------------------------------------
         shots = QWidget()
         sform = QFormLayout(shots)
+        self.shot_space = QComboBox()
+        self.shot_space.addItem("Image pixels (default)", "image_pixels")
+        self.shot_space.addItem("Normalized 0–1000 (Gemini-style)", "normalized_1000")
+        assert tuple(self.shot_space.itemData(i) for i in range(self.shot_space.count())) == COORDINATE_SPACES
+        self.shot_space.setToolTip("Explicit coordinate contract for mouse tools and screenshot regions. "
+                                   "Changes the prompt, tool schemas, grid labels and conversion together. "
+                                   "Model names (including Gemini aliases) never auto-select a mode. "
+                                   "Test mouse_move without clicking before using a new mode.")
+        sform.addRow("Coordinate space", self.shot_space)
         self.shot_width = QSpinBox()
         self.shot_width.setRange(320, 4096)
         self.shot_width.setSingleStep(64)
         self.shot_width.setSuffix(" px")
         sform.addRow("Max screenshot width", self.shot_width)
+        self.shot_native = QCheckBox("Native resolution (1:1 pixels, no resizing)")
+        self.shot_native.setToolTip("Sends the original capture dimensions; does NOT change Windows display resolution. "
+                                   "Useful for coordinate diagnostics, but may increase image/token cost. "
+                                   "The model provider may still resize images internally.")
+        self.shot_native.toggled.connect(self.shot_width.setDisabled)
+        sform.addRow("", self.shot_native)
         self.shot_grid = QCheckBox("Draw coordinate grid")
         sform.addRow("", self.shot_grid)
         self.shot_grid_spacing = QSpinBox()
         self.shot_grid_spacing.setRange(25, 500)
         self.shot_grid_spacing.setSuffix(" px")
         sform.addRow("Grid spacing", self.shot_grid_spacing)
+        self.shot_space.currentIndexChanged.connect(self._sync_coordinate_widgets)
         self.shot_cursor = QCheckBox("Mark the mouse cursor")
         sform.addRow("", self.shot_cursor)
         self.shot_format = QComboBox()
@@ -288,7 +304,10 @@ class SettingsDialog(QDialog):
         self.overlay_exclude.setChecked(cfg.overlay_exclude_from_capture)
         self._sync_overlay_widgets()
         self.extra_prompt.setPlainText(cfg.extra_system_prompt)
+        self.shot_space.setCurrentIndex(self.shot_space.findData(cfg.coordinate_space))
+        self._sync_coordinate_widgets()
         self.shot_width.setValue(cfg.screenshot_max_width)
+        self.shot_native.setChecked(cfg.screenshot_native_resolution)
         self.shot_grid.setChecked(cfg.screenshot_grid)
         self.shot_grid_spacing.setValue(cfg.screenshot_grid_spacing)
         self.shot_cursor.setChecked(cfg.screenshot_show_cursor)
@@ -301,6 +320,10 @@ class SettingsDialog(QDialog):
         self.mouse_failsafe.setChecked(cfg.mouse_failsafe)
         self.backend.setCurrentText(cfg.backend)
         self.log_level.setCurrentText(cfg.log_level)
+
+    def _sync_coordinate_widgets(self) -> None:
+        normalized = self.shot_space.currentData() == "normalized_1000"
+        self.shot_grid_spacing.setSuffix(" /1000" if normalized else " px")
 
     def _sync_overlay_widgets(self) -> None:
         on = self.gui_mode.currentData() == "overlay"
@@ -342,7 +365,9 @@ class SettingsDialog(QDialog):
         cfg.overlay_corner = self.overlay_corner.currentText()
         cfg.overlay_exclude_from_capture = self.overlay_exclude.isChecked()
         cfg.extra_system_prompt = self.extra_prompt.toPlainText()
+        cfg.coordinate_space = str(self.shot_space.currentData() or "image_pixels")
         cfg.screenshot_max_width = int(self.shot_width.value())
+        cfg.screenshot_native_resolution = self.shot_native.isChecked()
         cfg.screenshot_grid = self.shot_grid.isChecked()
         cfg.screenshot_grid_spacing = int(self.shot_grid_spacing.value())
         cfg.screenshot_show_cursor = self.shot_cursor.isChecked()

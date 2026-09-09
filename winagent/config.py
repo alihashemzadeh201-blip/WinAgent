@@ -28,6 +28,7 @@ ENV_OVERRIDES = {
 TOOL_PROTOCOLS = ("auto", "native", "json")
 BACKENDS = ("auto", "windows", "fake")
 SCREENSHOT_FORMATS = ("jpeg", "png")
+COORDINATE_SPACES = ("image_pixels", "normalized_1000")
 # What the GUI does with its own window while the agent is working:
 #   overlay  - minimise the main window and show a small always-on-top status overlay (default)
 #   visible  - keep the main window on screen; it hides itself only for the instant of a screenshot
@@ -94,7 +95,9 @@ class Config:
     extra_system_prompt: str = ""
 
     # --- Screenshots -----------------------------------------------------------
+    coordinate_space: str = "image_pixels"  # explicit contract; NEVER inferred from model name or coordinate values
     screenshot_max_width: int = 1280
+    screenshot_native_resolution: bool = False  # 1:1 capture pixels; may increase image/token cost
     screenshot_grid: bool = True
     screenshot_grid_spacing: int = 100
     screenshot_show_cursor: bool = True
@@ -134,6 +137,8 @@ class Config:
             problems.append(f"tool_protocol must be one of {TOOL_PROTOCOLS}.")
         if self.backend not in BACKENDS:
             problems.append(f"backend must be one of {BACKENDS}.")
+        if self.coordinate_space not in COORDINATE_SPACES:
+            problems.append(f"coordinate_space must be one of {COORDINATE_SPACES}.")
         if self.screenshot_format not in SCREENSHOT_FORMATS:
             problems.append(f"screenshot_format must be one of {SCREENSHOT_FORMATS}.")
         if self.gui_mode_while_running not in GUI_MODES:

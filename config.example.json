@@ -24,7 +24,9 @@
   "response_language": "auto",
   "extra_system_prompt": "",
 
+  "coordinate_space": "image_pixels",
   "screenshot_max_width": 1280,
+  "screenshot_native_resolution": false,
   "screenshot_grid": true,
   "screenshot_grid_spacing": 100,
   "screenshot_show_cursor": true,

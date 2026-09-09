@@ -371,6 +371,7 @@ class MainWindow(QMainWindow):
         self._last_shot = None
         self.shot_view.clear_image(text)
         self.shot_label.clear()
+        self.shot_label.setToolTip("")
         self.btn_open_shot.setEnabled(False)
 
     def _emergency_stop(self) -> None:
@@ -572,7 +573,12 @@ class MainWindow(QMainWindow):
         self.shot_view.set_image(shot.image)
         self.btn_open_shot.setEnabled(True)
         w, h = shot.size
-        self.shot_label.setText(f"{w}×{h}  (raw {shot.raw_size[0]}×{shot.raw_size[1]})  {time.strftime('%H:%M:%S', time.localtime(shot.taken_at))}")
+        mode = "1:1" if shot.size == shot.raw_size else "scaled"
+        if shot.coordinate_space == "normalized_1000":
+            mode += "; coords 0–1000"
+        self.shot_label.setText(f"{w}×{h}  (raw {shot.raw_size[0]}×{shot.raw_size[1]}, {mode})  "
+                                f"{time.strftime('%H:%M:%S', time.localtime(shot.taken_at))}")
+        self.shot_label.setToolTip(shot.describe() + f" Origin={shot.origin}; desktop bounds={shot.desktop_bounds}.")
 
     @Slot(int, int)
     def _on_step(self, step: int, max_steps: int) -> None:
