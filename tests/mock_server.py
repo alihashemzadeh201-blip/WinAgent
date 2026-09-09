@@ -32,7 +32,16 @@ def _last_user_text(messages: list[dict[str, Any]]) -> str:
 def _count_tool_rounds(messages: list[dict[str, Any]]) -> int:
     n = 0
     for m in messages:
-        if m.get("role") == "assistant" and (m.get("tool_calls") or '"actions"' in str(m.get("content", ""))):
+        if m.get("role") != "assistant":
+            continue
+        if m.get("tool_calls"):
+            n += 1
+            continue
+        try:
+            data = json.loads(m.get("content") or "")
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict) and data.get("actions"):
             n += 1
     return n
 
@@ -43,11 +52,18 @@ def _has_images(messages: list[dict[str, Any]]) -> bool:
 
 def plan(messages: list[dict[str, Any]]) -> tuple[str | None, list[tuple[str, dict[str, Any]]]]:
     """Return (text, tool_calls) for the next assistant turn."""
+    # The production agent labels the current request; past task summaries are context, not
+    # another run of the original script. Fall back to the first user for standalone mock clients.
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user" and _last_user_text([messages[i]]).startswith("[Current user request]\n"):
+            messages = messages[i:]
+            break
     first_user = next((m for m in messages if m.get("role") == "user"), None)
     task = ""
     if first_user:
         c = first_user.get("content")
         task = " ".join(p.get("text", "") for p in c if isinstance(p, dict)) if isinstance(c, list) else str(c)
+    task = task.removeprefix("[Current user request]\n")
     task_l = task.split("[Current screen attached")[0].lower()
     rounds = _count_tool_rounds(messages)
     if "notepad" in task_l or "نوت" in task_l or "یادداشت" in task_l:

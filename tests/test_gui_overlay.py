@@ -489,3 +489,30 @@ def test_gui_does_not_finish_on_unstructured_fragment_after_an_action(server, mo
         assert "task_complete" in requests[2][-1]["content"]
     finally:
         win.close()
+
+
+@pytest.mark.parametrize("protocol", ["native", "json"])
+@pytest.mark.parametrize("rebuild", [False, True])
+def test_same_window_can_run_followup_tasks_with_or_without_agent_rebuild(server, protocol, rebuild):
+    win = make_window(server, tool_protocol=protocol)
+    try:
+        run_task(win, "open notepad and write hello")
+        assert "Task completed" in win.status_label.text()
+        typed = list(win.backend.typed)
+        old_agent = win.agent
+        old_frame = win.agent._model_frame
+        if rebuild:
+            win._rebuild_agent()  # same path as saving settings, with the same desktop backend
+            assert win.agent is not old_agent
+            assert not any(m.get("tool_calls") or m.get("role") == "tool" for m in win.agent.history)
+        run_task(win, "take a screenshot and describe it")
+        assert "Task completed" in win.status_label.text()
+        assert win.backend.typed == typed
+        assert win.agent._model_frame.frame_id != old_frame.frame_id
+        assert win.agent.protocol == protocol
+        transcript = win.chat.transcript()
+        assert "open notepad and write hello" in transcript and "take a screenshot and describe it" in transcript
+        assert win.btn_send.isEnabled() and not win.btn_stop.isEnabled()
+        assert not win._pending_question
+    finally:
+        win.close()

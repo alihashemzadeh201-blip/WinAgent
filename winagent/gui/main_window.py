@@ -339,7 +339,7 @@ class MainWindow(QMainWindow):
             ask_user=self._ask_user_blocking,
             confirm=self._confirm_blocking,
         )
-        history = self.agent.history if self.agent else []
+        history = self.agent.followup_history() if self.agent else []
         self.guard.enabled = self.backend is not None and self.gui_mode != "none"
         self.agent = Agent(self.config, self.backend, events=events, guard=self.guard) if self.backend is not None else None
         if self.agent is not None:

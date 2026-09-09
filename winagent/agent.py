@@ -2,7 +2,7 @@
 
 ``Agent.run(task)`` sends the conversation to the model, executes the tool
 calls it returns, feeds the results (including screenshots) back, and repeats
-until the model calls ``task_complete``, replies with plain text, asks the
+until the model calls ``task_complete``, returns a structured chat answer, asks the
 user something, hits ``max_steps`` or is stopped.
 
 The class is UI-agnostic: progress is reported through :class:`AgentEvents`
@@ -11,6 +11,7 @@ callbacks so the same core drives the Qt GUI and the command line.
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 import time
@@ -19,6 +20,7 @@ from typing import Any, Callable, Optional
 
 from .backends.base import DesktopBackend, EmergencyStop
 from .config import Config
+from .history import progress_message, request_summary, result_record
 from .llm import LLMCancelled, LLMClient, LLMError, LLMResponseError
 from .prompts import TASK_IN_PROGRESS_PROMPT, build_system_prompt
 from .protocol import (
@@ -85,6 +87,13 @@ class Agent:
         self._image_slots: list[int] = []          # indexes of history messages that carry images
         self.protocol = self._initial_protocol()
         self.vision = bool(config.vision_enabled)
+        # Raw execution history is retained for inspection until the next request. Only a factual,
+        # protocol-neutral handoff is carried across requests (also when the GUI rebuilds the agent).
+        self._followup_history: Optional[list[dict[str, Any]]] = None
+        self._past_context: list[dict[str, Any]] = []
+        self._request_index = 0
+        self._has_progress_note = False
+        self._task_records: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self.running = False
 
@@ -103,6 +112,15 @@ class Agent:
             self._image_slots.clear()
             self.executor.last_screenshot = None
             self._model_frame = None
+            self._followup_history = None
+            self._past_context = []
+            self._request_index = 0
+            self._has_progress_note = False
+            self._task_records = []
+
+    def followup_history(self) -> list[dict[str, Any]]:
+        """Copy the conversation handoff, never old live tool calls, when starting/rebuilding a task."""
+        return copy.deepcopy(self._followup_history if self._followup_history is not None else self.history)
 
     def _confirm(self, call: ToolCall, reason: str) -> bool:
         try:
@@ -138,17 +156,31 @@ class Agent:
             idx = self._image_slots.pop(0)
             if idx < len(self.history):
                 self.history[idx] = _strip_images(self.history[idx])
-        # 2. cap total messages (keep the first user message for context)
+        # 2. Evict complete old request pairs first. The CURRENT user's request must never be cut.
         limit = max(10, self.config.max_history_messages)
-        if len(self.history) > limit:
-            overflow = len(self.history) - limit
-            first = self.history[0]
-            cut = self.history[1 + overflow:]
-            # never start with an orphan tool message
-            while cut and cut[0].get("role") == "tool":
-                cut.pop(0)
-            self.history = [first, *cut]
-            self._image_slots = [i for i in range(len(self.history)) if _has_image(self.history[i])]
+        while len(self.history) > limit and self._request_index > 0:
+            count = min(2, self._request_index)
+            del self.history[:count]
+            self._request_index -= count
+        # 3. Trim whole execution rounds, not individual native calls/results. Keep the latest
+        # round and retained image rounds: dropping their image could leave _model_frame pointing
+        # at an unseen frame while an older screenshot is still in the request. These small sets
+        # (or one large atomic batch) may exceed the soft message limit.
+        while len(self.history) > limit:
+            start = self._request_index + 1 + int(self._has_progress_note)
+            boundaries = [i for i in range(start, len(self.history)) if self.history[i].get("role") == "assistant"]
+            removable = next(((left, right) for left, right in zip(boundaries, boundaries[1:], strict=False)
+                              if not any(_has_image(msg) for msg in self.history[left:right])), None)
+            if removable is None:
+                break
+            left, right = removable
+            del self.history[left:right]
+            if not self._has_progress_note:
+                self.history.insert(self._request_index + 1, progress_message(self._task_records))
+                self._has_progress_note = True
+        if self._has_progress_note:
+            self.history[self._request_index + 1] = progress_message(self._task_records)
+        self._image_slots = [i for i, msg in enumerate(self.history) if _has_image(msg)]
 
     def _user_message(self, text: str, shot: Optional[Screenshot] = None) -> dict[str, Any]:
         if shot is not None and self.vision:
@@ -171,18 +203,33 @@ class Agent:
         steps = 0
         n_calls = 0
         outcome = RunOutcome("error")
+        self._past_context = self.followup_history()
+        self.history = copy.deepcopy(self._past_context)
+        self._request_index = len(self.history)
+        self._has_progress_note = False
+        self._task_records = []
+        self._image_slots = [i for i, msg in enumerate(self.history) if _has_image(msg)]
+        # No image from a previous request is a current coordinate frame. A failed/disabled
+        # initial capture must not silently reuse the old desktop or its completion state.
+        self._model_frame = None
+        self.executor.last_screenshot = None
         try:
             shot = None
+            capture_error = ""
             if initial_screenshot and self.vision:
                 try:
                     self.events.on_status("Taking screenshot…")
                     shot = self.executor.take_screenshot()
                     self.events.on_screenshot(shot)
                 except Exception as exc:
+                    capture_error = str(exc)
                     log.warning("initial screenshot failed: %s", exc)
-            text = task
+            text = f"[Current user request]\n{task}"
             if shot is not None:
-                text = f"{task}\n\n[Current screen attached. {shot.describe()}]"
+                text += f"\n\n[Current screen attached. {shot.describe()}]"
+            elif capture_error:
+                text += ("\n\n[No current screenshot is available. Do not use coordinates from a previous request. "
+                         f"Request a fresh screenshot or use non-pointer tools. Capture error: {capture_error[:500]}]")
             self._append(self._user_message(text, shot), has_image=shot is not None)
 
             while True:
@@ -299,6 +346,16 @@ class Agent:
         outcome.tool_calls = n_calls
         outcome.duration = time.time() - start
         outcome.usage = {"prompt_tokens": self.llm.total_prompt_tokens, "completion_tokens": self.llm.total_completion_tokens}
+        # Close the assistant turn after terminal tool results and preserve a compact, factual
+        # handoff for a follow-up. Do not execute anything, call the model, or pretend errors succeeded.
+        closing = request_summary(outcome.message, outcome.status, self._task_records)
+        if n_calls or outcome.status not in ("completed", "answered"):
+            self._append(closing)
+        self._followup_history = [*self._past_context, {"role": "user", "content": task}, closing]
+        keep = max(2, (max(10, self.config.max_history_messages) - 2) // 2 * 2)
+        self._followup_history = self._followup_history[-keep:]
+        log.info("Request ended: status=%s actions=%d; retained %d prior request summaries for follow-up.",
+                 outcome.status, n_calls, len(self._followup_history) // 2)
         self.events.on_done(outcome)
         return outcome
 
@@ -307,15 +364,21 @@ class Agent:
         """Add tool results (and the newest screenshot) to the history."""
         latest_shot: Optional[Screenshot] = None
         for r in results:
+            record = result_record(r)
+            if record is not None:
+                self._task_records.append(record)
             if r.screenshot is not None:
                 latest_shot = r.screenshot
         if latest_shot is not None and self.vision and not latest_shot.is_region:
             self._model_frame = latest_shot
         if self.protocol == "native":
-            for r in results:
-                self._append(tool_result_message_native(r.call, r.to_text()))
+            # Publish the whole matching result batch before trimming; partial batches can leave
+            # orphan results or assistant calls without replies at the next HTTP request.
+            self.history.extend(tool_result_message_native(r.call, r.to_text()) for r in results)
             if latest_shot is not None and self.vision:
-                self._append(self._user_message(f"[Screenshot after the actions above. {latest_shot.describe()}]", latest_shot), has_image=True)
+                self.history.append(self._user_message(f"[Screenshot after the actions above. {latest_shot.describe()}]", latest_shot))
+                self._image_slots.append(len(self.history) - 1)
+            self._trim()
         else:
             msg = tool_results_message_json([(r.call, r.to_text()) for r in results])
             if latest_shot is not None and self.vision:
@@ -416,7 +479,7 @@ class Agent:
         return (f"Your previous response was invalid: {reason[:500]}\n"
                 "It was discarded; NO actions from that response were executed. Send a COMPLETE replacement, "
                 "not a continuation. Do not simply quote or wrap the broken fragment as an answer/summary. "
-                "Reconsider the user's original task using the screenshot and tool results already provided; "
+                "Reconsider the CURRENT user request, not an earlier completed task, using the screenshot and tool results already provided; "
                 "do NOT repeat earlier successful actions. Do not echo screenshot metadata or return only reasoning. "
                 "Preserve any refusal or inability honestly. Keep the response concise and in the original user's language. "
                 + protocol + terminal)

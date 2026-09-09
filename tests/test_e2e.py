@@ -121,3 +121,48 @@ def test_arbitrary_fragments_do_not_end_tool_work_over_http(server, monkeypatch)
     assert texts == ["Recovered safely."]
     assert len(srv.RequestHandlerClass.requests_log) == (4 if native else 5)  # optional native->JSON negotiation
     assert "b sideways." not in str(agent.history)
+
+
+def test_followup_after_completion_recovers_over_http_without_old_tool_history(server, monkeypatch):
+    from tests import mock_server
+
+    srv, url, native = server
+    cfg, backend = make(url)
+    original_plan = mock_server.plan
+    injected = []
+
+    def followup_plan(messages):
+        # Simulate an adapter/model confused by a completed function-call transcript on a new task.
+        # Also inject one real format fault even for a clean follow-up to exercise bounded recovery.
+        current = next((mock_server._last_user_text([m]) for m in reversed(messages)
+                        if m.get("role") == "user" and mock_server._last_user_text([m]).startswith("[Current user request]")), "")
+        if "describe it next" in current:
+            old_completion = any(
+                any(call["function"]["name"] == "task_complete" for call in m.get("tool_calls", []))
+                or (m.get("role") == "assistant" and '"tool": "task_complete"' in str(m.get("content")))
+                for m in messages
+            )
+            if old_completion or not injected:
+                injected.append(True)
+                return "b sideways.", []
+        return original_plan(messages)
+
+    monkeypatch.setattr(mock_server, "plan", followup_plan)
+    texts = []
+    agent = Agent(cfg, backend, LLMClient(cfg), AgentEvents(on_assistant_text=texts.append))
+    assert agent.run("open notepad and write hello").status == "completed"
+    typed = list(backend.typed)
+    old_frame = agent._model_frame
+    before = len(srv.RequestHandlerClass.requests_log)
+    assert agent.run("take a screenshot and describe it next").status == "completed"
+    assert backend.typed == typed and injected == [True]
+    assert "b sideways." not in texts
+    assert agent.protocol == ("native" if native else "json")
+    requests = srv.RequestHandlerClass.requests_log[before:]
+    assert len(requests) == 4  # rejected reply, corrected screenshot, screen info, completion
+    assert requests[1]["messages"][:-1] == requests[0]["messages"]
+    assert old_frame.frame_id not in str(requests[0]["messages"])
+    assert sum(sum(part.get("type") == "image_url" for part in m["content"])
+               for m in requests[0]["messages"] if isinstance(m.get("content"), list)) == 1
+    assert agent.run("thanks").status == "answered"
+    assert backend.typed == typed

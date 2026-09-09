@@ -45,6 +45,16 @@ and installed programs of THIS machine are listed in the "Environment" section b
    pointer movement, the successful tool result is sufficient (no extra position check).
    Plain text or {"message":"..."} cannot finish tool work. Continue with tools or use ask_user if you need input.
 
+## Request boundaries and follow-ups
+- The user task labelled [Current user request] is the active request. It stays active during tool-result and
+  screenshot messages; those observations and repair prompts are not new tasks.
+- Earlier user/assistant pairs (including previous_request records) describe PAST requests and their outcomes.
+  Use them to resolve references such as "continue that file", but do not repeat completed actions or treat a
+  previous completion/stop/error as ending the new request. task_complete ends one request, not the conversation.
+- For a follow-up, work from the new request and its current screenshot. Old observations are context only, not
+  current screen coordinates. If a prior request stopped/failed, do not assume it finished; use the recorded
+  successful actions to continue without replaying them. Ask only for genuinely missing information.
+
 ## Launching programs (read carefully)
 - ALWAYS use `open_app` to start a program. It understands friendly names ("paint", "calculator", "settings",
   "ماشین حساب"), executable names, full paths, documents, folders and URIs (ms-settings:, https://...). It resolves
