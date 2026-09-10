@@ -1081,6 +1081,21 @@ class WindowsBackend(DesktopBackend):
             return None
         return self._menu_node(int(hmenu), 0, 3, 80)
 
+    def menu_open(self) -> bool:
+        """Cheap check for a classic popup menu (windows of class #32768) – no item enumeration."""
+        found = False
+
+        @WNDENUMPROC
+        def _cb(hwnd, _lparam):
+            nonlocal found
+            if self.user32.IsWindowVisible(hwnd) and self._class_name(hwnd) == "#32768":
+                found = True
+                return False
+            return True
+
+        self.user32.EnumWindows(_cb, 0)
+        return found
+
     def open_menu_items(self) -> list[dict[str, Any]]:
         """Items of the popup/context menu currently open (windows of class #32768), or []."""
         handles: list[int] = []

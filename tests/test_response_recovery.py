@@ -219,3 +219,66 @@ def test_feature_negotiation_during_recovery_has_a_separate_budget(config, backe
     else:
         assert not agent.vision
         assert all(not isinstance(m.get("content"), list) for m in llm.calls[-1]["messages"])
+
+# ---------------------------------------------------------------------------
+# A JSON-protocol model that keeps answering in PROSE while tool work is in
+# progress (typical after a stall on an impossible step) must end the task
+# with its own honest words – not crash with "response still invalid".
+# ---------------------------------------------------------------------------
+def test_in_progress_json_prose_answer_ends_task_gracefully(config, backend):
+    config.tool_protocol = "json"
+    config.max_response_retries = 1
+    prose = "The combo box is disabled; I will skip this step."
+    llm = ScriptedLLM([
+        json.dumps({"actions": [{"tool": "click", "args": {"x": 10, "y": 10}}]}),
+        prose, prose,
+    ])
+    errors = []
+    agent = Agent(config, backend, llm, AgentEvents(on_error=errors.append))
+    outcome = agent.run("click that combo box", initial_screenshot=False)
+    assert outcome.status == "answered" and outcome.message == prose
+    assert errors == []
+    assert len(llm.calls) == 3  # action, prose (rejected), prose (graceful finish)
+    # the repair prompt (added on the second retry) shows the model the exact task_complete template
+    repair = llm.calls[2]["messages"][-1]["content"]
+    assert "finish NOW with exactly one JSON object" in repair
+    assert '"tool":"task_complete"' in repair
+
+
+def test_in_progress_json_message_envelope_ends_task_gracefully(config, backend):
+    config.tool_protocol = "json"
+    config.max_response_retries = 1
+    env = json.dumps({"message": "Skipping the disabled combo box; the rest is done."})
+    llm = ScriptedLLM([
+        json.dumps({"actions": [{"tool": "click", "args": {"x": 10, "y": 10}}]}),
+        env, env,
+    ])
+    outcome = Agent(config, backend, llm).run("work", initial_screenshot=False)
+    assert outcome.status == "answered"
+    assert outcome.message == "Skipping the disabled combo box; the rest is done."
+    assert len(llm.calls) == 3
+
+
+def test_in_progress_json_truncated_json_still_errors(config, backend):
+    config.tool_protocol = "json"
+    config.max_response_retries = 1
+    truncated = '{"actions":[{"tool":"task_complete","args":{"summary":"done'
+    llm = ScriptedLLM([
+        json.dumps({"actions": [{"tool": "click", "args": {"x": 10, "y": 10}}]}),
+        truncated, truncated,
+    ])
+    errors = []
+    outcome = Agent(config, backend, llm, AgentEvents(on_error=errors.append)).run("work", initial_screenshot=False)
+    assert outcome.status == "error"
+    assert errors and "invalid after 2 attempts" in errors[0]
+    assert "Max tokens" in errors[0]
+
+
+def test_prose_before_tool_work_still_requires_json(config, backend):
+    # the graceful path is only for IN-PROGRESS tasks; an initial chat answer must stay JSON
+    config.tool_protocol = "json"
+    config.max_response_retries = 0
+    llm = ScriptedLLM(["Just a plain text answer."])
+    outcome = Agent(config, backend, llm).run("question", initial_screenshot=False)
+    assert outcome.status == "error"
+    assert len(llm.calls) == 1

@@ -156,6 +156,28 @@ class ToolExecutor:
             self._check_frame()
             yield
 
+    def _menu_open_guard(self) -> None:
+        """Block pointer input while a menu is open (menu bar / submenu / context menu).
+
+        Moving the pointer over an open menu – or clicking into it – DISMISSES the menu instead of
+        selecting anything; that is why menus "close by themselves" when the model tries the mouse.
+        Refuse the action and show the keyboard route plus the currently visible items.
+        """
+        if not self.backend.menu_open():
+            return
+        try:
+            items = self.backend.open_menu_items()
+        except Exception:
+            items = []
+        labels = [str(i.get("text")) for i in items if i.get("text")][:12]
+        raise BackendError(
+            "A menu is currently open on screen, so pointer input is blocked: moving or clicking with "
+            "the mouse while a menu is open dismisses the menu WITHOUT selecting the item. Choose it "
+            "with the keyboard instead – the `menu` tool (action=\"select\", item=\"<name>\") or press_keys "
+            "(Down/Up = move, Right = open a submenu, Enter = confirm) – or press Esc to close the menu "
+            f"without choosing. Visible items: {', '.join(labels)}."
+            " No pointer input was sent.")
+
     # ------------------------------------------------------------ screenshot
     def take_screenshot(self, *, region: Optional[list[int]] = None, all_screens: bool = False,
                         grid: Optional[bool] = None) -> Screenshot:
@@ -498,12 +520,14 @@ class ToolExecutor:
 
     # ----------------------------------------------------------------- mouse
     def _t_mouse_move(self, call: ToolCall, a: dict[str, Any]) -> ToolResult:
+        self._menu_open_guard()
         x, y = self._phys(a.get("x"), a.get("y"))
         with self._pointer_guard(point=(x, y)):
             self.backend.mouse_move(x, y, duration=0.25)
         return ToolResult(call, True, {"message": f"Mouse moved to physical ({x},{y})."})
 
     def _t_click(self, call: ToolCall, a: dict[str, Any]) -> ToolResult:
+        self._menu_open_guard()
         button = str(a.get("button") or "left").lower()
         clicks = _to_int(a.get("clicks", 1), "clicks")
         clicks = min(max(clicks, 1), 3)
@@ -529,6 +553,7 @@ class ToolExecutor:
         return self._t_click(call, {**a, "clicks": 1, "button": "right"})
 
     def _t_drag(self, call: ToolCall, a: dict[str, Any]) -> ToolResult:
+        self._menu_open_guard()
         x1, y1 = self._phys(a.get("x1"), a.get("y1"))
         x2, y2 = self._phys(a.get("x2"), a.get("y2"))
         duration = float(a.get("duration") or 0.5)
@@ -537,6 +562,7 @@ class ToolExecutor:
         return ToolResult(call, True, {"message": f"Dragged from ({x1},{y1}) to ({x2},{y2}) physical px."})
 
     def _t_scroll(self, call: ToolCall, a: dict[str, Any]) -> ToolResult:
+        self._menu_open_guard()
         amount = _to_int(a.get("amount", a.get("clicks", -3)), "amount")
         amount = max(-50, min(50, amount))
         direction = str(a.get("direction") or "vertical").lower()

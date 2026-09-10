@@ -510,6 +510,9 @@ class FakeBackend(DesktopBackend):
             return [dict(i) for i in self.fake_menu_stack[-1]]
         return [dict(i) for i in (self.fake_open_popup or [])]
 
+    def menu_open(self) -> bool:
+        return bool(self.fake_menu_stack or self.fake_open_popup)
+
     # ------------------------------------------------------------------- misc
     def system_info(self) -> dict[str, Any]:
         return {

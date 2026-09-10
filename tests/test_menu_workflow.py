@@ -131,3 +131,46 @@ def test_correct_layout_adds_no_note(app, config):
     assert result.ok
     assert result.data.get("layout") in (None, "")
     assert app.layout_changes == []
+
+
+def test_pointer_input_blocked_while_menu_open(app, config):
+    # a menu is open; every pointer tool must be refused (and nothing must reach the desktop)
+    app.fake_menu_stack = [[{"text": "New", "mnemonic": "n"}, {"text": "Save", "mnemonic": "s"}]]
+    app.fake_menu_typed = [""]
+    ex = ToolExecutor(app, config)
+    res = ex.execute(ToolCall("click", {"x": 100, "y": 200}))
+    assert not res.ok
+    assert "menu is currently open" in res.error
+    assert "New" in res.error and "Save" in res.error          # the visible items are offered
+    assert "`menu`" in res.error                                 # the keyboard route is shown
+    for name, args in (("mouse_move", {"x": 100, "y": 200}), ("scroll", {"amount": -3}),
+                       ("right_click", {"x": 100, "y": 200}),
+                       ("drag", {"x1": 10, "y1": 10, "x2": 50, "y2": 50})):
+        r2 = ex.execute(ToolCall(name, args))
+        assert not r2.ok and "menu is currently open" in r2.error
+    mouse_events = [e for e in app.events if e["kind"] in ("move", "click", "drag", "down", "up", "scroll")]
+    assert mouse_events == []
+
+
+def test_keyboard_selection_unblocks_pointer(app, config):
+    # the menu tool (keyboard) works while the menu is open and unblocks the mouse afterwards
+    app.fake_menu_stack = [[{"text": "New", "mnemonic": "n"}, {"text": "Save", "mnemonic": "s"}]]
+    app.fake_menu_typed = [""]
+    ex = ToolExecutor(app, config)
+    res = ex.execute(ToolCall("menu", {"action": "select", "item": "Save"}))
+    assert res.ok, res.error
+    assert app.menu_selections == ["Save"]
+    assert app.fake_menu_stack == []
+    res_click = ex.execute(ToolCall("click", {"x": 300, "y": 400}))
+    assert res_click.ok, res_click.error
+    assert any(e["kind"] == "click" for e in app.events)
+
+
+def test_closed_menu_via_esc_unblocks_pointer(app, config):
+    app.fake_menu_stack = [[{"text": "New", "mnemonic": "n"}]]
+    app.fake_menu_typed = [""]
+    ex = ToolExecutor(app, config)
+    res = ex.execute(ToolCall("menu", {"action": "close"}))
+    assert res.ok
+    res_click = ex.execute(ToolCall("click", {"x": 300, "y": 400}))
+    assert res_click.ok, res_click.error

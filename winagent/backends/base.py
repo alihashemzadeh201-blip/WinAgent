@@ -208,6 +208,18 @@ class DesktopBackend(ABC):
         """Items of the popup menu (context menu / submenu) currently open on screen, or []."""
         return []
 
+    def menu_open(self) -> bool:
+        """True while a popup menu (menu-bar dropdown, submenu or context menu) is open on screen.
+
+        Used to block pointer input while a menu is open: moving or clicking with the mouse dismisses
+        the menu instead of selecting the item. The default reuses :meth:`open_menu_items`; backends
+        may override with a cheaper check.
+        """
+        try:
+            return bool(self.open_menu_items())
+        except Exception:
+            return False
+
     # -------------------------------------------------------------------- misc
     @abstractmethod
     def system_info(self) -> dict[str, Any]: ...

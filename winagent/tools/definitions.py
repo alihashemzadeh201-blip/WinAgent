@@ -78,7 +78,9 @@ TOOLS: list[ToolSpec] = [
         description=(
             "Move the mouse pointer to (x, y) without clicking (useful for hover menus/tooltips). "
             "No automatic screenshot is taken. Request screenshot only if you need to inspect a hover-induced UI change "
-            "or the user explicitly asks to verify the pointer. To click, call click directly with x/y instead."
+            "or the user explicitly asks to verify the pointer. To click, call click directly with x/y instead. "
+            "Never move the pointer over an open menu – that dismisses it; menu navigation is keyboard-only "
+            "(`menu` tool / arrow keys)."
         ),
         parameters=_obj(_XY, ["x", "y"]), screenshot_after=False, category="mouse",
     ),
@@ -87,7 +89,10 @@ TOOLS: list[ToolSpec] = [
         description=(
             "Click at (x, y) in screenshot coordinates; movement to the target is automatic, so no separate mouse_move is needed. "
             "If x/y are omitted, click at the current pointer position. "
-            "Use button='right' for context menus, clicks=2 for double-click. Hold modifier keys with `modifiers`."
+            "Use button='right' for context menus, clicks=2 for double-click. Hold modifier keys with `modifiers`. "
+            "NEVER click menus (menu-bar items, open menus/submenus, context-menu items): pointer input is blocked while a "
+            "menu is open, and any mouse movement there would dismiss the menu – open and choose menu items with the `menu` "
+            "tool (keyboard only) or arrow keys."
         ),
         parameters=_obj({
             **_XY,
@@ -103,7 +108,11 @@ TOOLS: list[ToolSpec] = [
     ),
     ToolSpec(
         name="right_click",
-        description="Right-click at (x, y) to open a context menu.",
+        description=(
+            "Right-click at (x, y) to open a context menu – the ONLY mouse action allowed on menus (opening only). "
+            "Once the context menu is open, do NOT click or hover its items: choose with the `menu` tool "
+            "(action='select', item=...) or the arrow keys (Down/Up, Right, Enter). Pointer input is blocked while it is open."
+        ),
         parameters=_obj(_XY, ["x", "y"]), category="mouse",
     ),
     ToolSpec(
@@ -169,8 +178,9 @@ TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="menu",
         description=(
-            "Work with application MENUS (menu bar, submenus, context menus) using the KEYBOARD only – never hover "
-            "or click with the mouse, because moving the pointer over an open menu dismisses submenus. "
+            "The ONLY tool for application MENUS (menu bar, submenus, context menus) – the KEYBOARD is the only way "
+            "(never open or choose menu items with the mouse: moving the pointer over an open menu dismisses it, and "
+            "pointer input is blocked while a menu is open). "
             "action='list': show the enumerable menu-bar structure of a window plus any popup menu that is currently "
             "open (call this first to see the item names). "
             "action='select' with path=[\"File\",\"Export\",\"PDF\"]: open the menu-bar item and walk the whole path "
@@ -314,8 +324,9 @@ TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="task_complete",
         description=(
-            "Call this when the user's request has been fully accomplished (or cannot be done). Provide a concise "
-            "summary of what was done and the final result. After this call, no more actions are executed."
+            "Call this when the user's request has been fully accomplished (or cannot be done) – it is the ONLY way "
+            "to end a task; never end one with plain text. Provide a concise summary of what was done and the final "
+            "result. If some steps were impossible, say which ones and why. After this call, no more actions are executed."
         ),
         parameters=_obj({
             "summary": {"type": "string", "description": "What was done and the result, in the user's language."},

@@ -32,6 +32,7 @@ from .protocol import (
     assistant_message_json,
     assistant_message_native,
     image_part,
+    looks_structured,
     parse_json_protocol,
     parse_native_response,
     response_text,
@@ -527,6 +528,8 @@ class Agent:
         coordinate_space = coordinate_space or self.config.coordinate_space
         retries = 0
         repair_reason = ""
+        last_content = ""          # raw text of the most recently rejected response
+        last_turn: Optional[AssistantTurn] = None  # its parsed form, when parsing itself succeeded
         while True:
             if self.stop_event.is_set():
                 raise LLMCancelled("stopped")
@@ -552,9 +555,13 @@ class Agent:
                 if self.protocol == "native" or resp.message.get("tool_calls") or resp.message.get("function_call") is not None:
                     turn = parse_native_response(resp.message, allow_plain_text=False)
                 else:
-                    turn = parse_json_protocol(response_text(resp.message.get("content")))
+                    content = response_text(resp.message.get("content"))
+                    last_content = content if isinstance(content, str) else ""
+                    turn = parse_json_protocol(last_content)
                 if turn.parse_error:
+                    last_turn = None
                     raise LLMResponseError(turn.parse_error)
+                last_turn = turn
                 if task_in_progress and not turn.tool_calls:
                     raise LLMResponseError("Tool work is in progress: a message alone cannot end the task. "
                                            "Continue with tools, ask_user, or explicitly call task_complete.")
@@ -569,6 +576,17 @@ class Agent:
                 if self.stop_event.is_set():
                     raise LLMCancelled("stopped") from exc
                 if retries >= self.config.max_response_retries:
+                    # A JSON-protocol model that keeps answering in prose (or with a {"message": ...}
+                    # envelope) while work is in progress will never learn the action format. The
+                    # expectation for a stuck/impossible step is to be SKIPPED, so end the request
+                    # with the model's own honest words instead of a protocol crash.
+                    graceful = self._graceful_finish_turn(task_in_progress, last_turn, last_content)
+                    if graceful is not None:
+                        log.warning("Model kept returning non-action output after %d attempts; finishing the "
+                                    "task with its text answer: %.200s", retries + 1, (last_content or graceful.text or ""))
+                        self.events.on_status("The model answered with text instead of actions – finishing with its answer.")
+                        graceful.finish_reason = graceful.finish_reason or "stop"
+                        return graceful
                     raise LLMError(f"Model response is still invalid after {retries + 1} attempts: {exc} "
                                    "No actions from the rejected response were executed. "
                                    "Check the model/tool protocol or increase Max tokens for truncated output.") from exc
@@ -601,6 +619,10 @@ class Agent:
             "Tool work has started. Do not end with plain text or a message object: continue with the next tool, "
             "use ask_user, or call task_complete with a non-empty, truthful summary. "
             "Use success=false if unable to complete or declining, rather than inventing success. "
+            + ("If the remaining work is impossible (e.g. a disabled control), finish NOW with exactly one JSON "
+               'object, nothing else: {"actions":[{"tool":"task_complete","args":'
+               '{"summary":"<honest summary in the user language>","success":false}}]} '
+               if self.protocol == "json" else "")
             if task_in_progress else
             'For a complete answer needing no tools, return ONE JSON content object {"message":"your full answer"}, '
             'not bare text. '
@@ -612,6 +634,25 @@ class Agent:
                 "do NOT repeat earlier successful actions. Do not echo screenshot metadata or return only reasoning. "
                 "Preserve any refusal or inability honestly. Keep the response concise and in the original user's language. "
                 + protocol + terminal)
+
+    def _graceful_finish_turn(self, task_in_progress: bool, last_turn: Optional[AssistantTurn],
+                              last_content: str) -> Optional[AssistantTurn]:
+        """Convert an exhausted JSON-protocol retry loop into the model's own final words.
+
+        Only when tool work is in progress and the model's last response was GENUINE TEXT (plain
+        prose, or an explicit {"message": ...} envelope with no actions) – i.e. the model chose to
+        talk instead of act, which is usually the honest "this step is impossible, skipping it"
+        answer after a stall. Structured garbage (truncated JSON, broken arguments) is never
+        accepted here: that stays an error, because it contains no trustworthy final words.
+        """
+        if not task_in_progress or self.protocol != "json":
+            return None
+        if last_turn is not None and not last_turn.tool_calls and not last_turn.parse_error and last_turn.text.strip():
+            return last_turn  # the model explicitly wrapped its answer as {"message": "..."}
+        content = (last_content or "").strip()
+        if not content or looks_structured(content):
+            return None
+        return AssistantTurn(text=content, raw_content=last_content)
 
     def _switch_to_json(self) -> None:
         self.protocol = "json"

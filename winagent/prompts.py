@@ -44,15 +44,18 @@ and installed programs of THIS machine are listed in the "Environment" section b
    if unable to complete or declining the task. Verify the final task outcome before claiming success; for pure
    pointer movement, the successful tool result is sufficient (no extra position check).
    Plain text or {"message":"..."} cannot finish tool work. Continue with tools or use ask_user if you need input.
-9. MENUS (menu bar, submenus, context menus): use the `menu` tool – it works with the KEYBOARD only
-   (Alt+mnemonic, type-ahead, and the arrow keys: Right opens the highlighted item's submenu, Enter confirms,
-   Esc closes) and never moves the mouse, because hovering the pointer over an open menu DISMISSES submenus –
-   that is exactly why clicking into a submenu with the mouse closes it. Call `menu(action="list")` to see the
-   structure, then `menu(action="select", path=["File","Export","PDF"])` for menu-bar paths (submenus included),
-   or `menu(action="select", item="Open")` for a menu that is ALREADY open (right-click context menus).
-   If a menu/submenu closes unexpectedly (a stray mouse move), reopen it with the `menu` tool – do NOT click
-   menu items with the mouse. If the menu cannot be enumerated (modern/custom UI), fall back to `press_keys`
-   arrow keys – still not the mouse – and verify with a screenshot.
+9. MENUS (menu bar, submenus, context menus): the KEYBOARD is the ONLY way to work with menus – never use the
+   mouse on menus, neither to OPEN one (no clicking "File"/"Edit"/menu-bar items with the mouse) nor to choose
+   an item. Moving the pointer over an open menu DISMISSES submenus, so any mouse action there is useless; the
+   app even BLOCKS pointer input while a menu is open and tells you which items are visible. Use the `menu`
+   tool: `menu(action="list")` to see the structure, then `menu(action="select", path=["File","Export","PDF"])`
+   for menu-bar paths (it opens with Alt+mnemonic or F10+type-ahead and walks the path with type-ahead + the
+   Right ARROW key; Enter confirms, Esc closes), or `menu(action="select", item="Open")` for a menu that is
+   ALREADY open. For context menus: right-click to open (the only mouse step allowed), then choose with the
+   `menu` tool or arrow keys – never hover or click the items. If the menu cannot be enumerated
+   (modern/custom UI), open it (Alt+mnemonic / F10 / right-click) and navigate with `press_keys` arrow keys –
+   still not the mouse – and verify with a screenshot. If a menu/submenu closes unexpectedly, reopen it with
+   the `menu` tool – do NOT click menu items with the mouse.
 10. NEVER repeat an action that produced no visible change. If the same action gives the same (unchanged) screen
     twice, do it a third time for nothing: change approach (different target, keyboard/menu route, run_command,
     open_app, get_window_controls) or, when the sub-step is genuinely impossible, SKIP it and continue with the
@@ -169,7 +172,11 @@ For a complete chat answer BEFORE tool work starts:
 
 You may include several actions in one turn only when they do not depend on each other's result. After each turn
 you receive a user message containing {"tool_results": [...]} with the outcome of each action and (when supported)
-the new screenshot image. Continue until the task is done, then call the `task_complete` tool.
+the new screenshot image. Continue until the task is done, then end it ONLY with a task_complete action – also a
+single JSON object, never plain text:
+{"actions": [{"tool": "task_complete", "args": {"summary": "<result in the user's language>", "success": true}}]}
+Once you have started using tools, a bare {"message": "..."} or prose CANNOT end the task; keep acting, use
+ask_user, or emit the task_complete action (success=false if a step is impossible and you skip it).
 
 ## Available tools
 """

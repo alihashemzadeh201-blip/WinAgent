@@ -254,6 +254,20 @@ def _bad_turn(content: str, error: str) -> AssistantTurn:
     return AssistantTurn(raw_content=content, parse_error=error)
 
 
+_STRUCTURED_HEAD = re.compile(r"\s*(?:\{|\[\s*(?:\{|\[|\"|\d|\]))")
+
+
+def looks_structured(content: str) -> bool:
+    """True when the text starts like a JSON document or embeds protocol-looking JSON keys.
+
+    Used to tell *the model answered in prose* apart from *a broken/truncated JSON attempt*:
+    prose may be surfaced as the model's final words, structured garbage must not.
+    """
+    text = content or ""
+    return bool(_STRUCTURED_HEAD.match(text)
+                or re.search(r'```\s*json\b|["\'](?:actions|tool_calls)["\']\s*:', text, re.I))
+
+
 def _field_text(data: dict[str, Any], *keys: str) -> str:
     for key in keys:
         value = data.get(key)
@@ -316,9 +330,7 @@ def parse_json_protocol(content: str, *, allow_plain_text: bool = False) -> Assi
         except ProtocolError as exc:
             return _bad_turn(content, str(exc))
     # Don't disguise truncated JSON/function calls as a successful plain-text answer.
-    looks_structured = bool(re.match(r"\s*(?:\{|\[\s*(?:\{|\[|\"|\d|\]))", content)
-                            or re.search(r'```\s*json\b|["\'](?:actions|tool_calls)["\']\s*:', content, re.I))
-    if allow_plain_text and not looks_structured:
+    if allow_plain_text and not looks_structured(content):
         return AssistantTurn(text=content.strip(), raw_content=content)
     # Native models may legitimately answer a data question with a complete, non-protocol JSON document.
     if allow_plain_text:
