@@ -20,6 +20,79 @@ from PIL import Image, ImageDraw, ImageFont
 from .backends.base import ScreenGeometry
 from .config import COORDINATE_SPACES
 
+# Max Hamming distance (in bits of the 256-bit average hash) for two full captures to count as
+# "the same screen" (duplicate-screenshot suppression). A moved/blinked cursor or a clock tick
+# flips ~1-2 bits; a real UI change (menu opened, window activated, text edited in a large area)
+# flips far more. 5 bits ~= 2% of the 16x16 hash grid.
+DEDUPE_HAMMING_LIMIT = 5
+
+
+def average_hash(img: Image.Image, size: int = 16) -> str:
+    """256-bit average hash of an image, as a 64-char hex string (cheap duplicate detection)."""
+    gray = img.convert("L").resize((size, size), Image.LANCZOS)
+    if hasattr(gray, "get_flattened_data"):  # Pillow >= 12.2
+        px = list(gray.get_flattened_data())
+    else:
+        px = list(gray.getdata())
+    avg = sum(px) / len(px)
+    bits = [p > avg for p in px]
+    out = bytearray()
+    for i in range(0, len(bits), 8):
+        byte = 0
+        for j in range(8):
+            byte = (byte << 1) | (1 if bits[i + j] else 0)
+        out.append(byte)
+    return out.hex()
+
+
+def hash_distance(a: str, b: str) -> int:
+    """Hamming distance between two average-hash hex strings (large when unknown/incompatible)."""
+    if not a or not b or len(a) != len(b):
+        return 1 << 30
+    try:
+        x, y = bytes.fromhex(a), bytes.fromhex(b)
+    except ValueError:
+        return 1 << 30
+    return sum(bin(i ^ j).count("1") for i, j in zip(x, y))
+
+
+def _pixels(img: Image.Image):
+    if hasattr(img, "get_flattened_data"):  # Pillow >= 12.2
+        return list(img.get_flattened_data())
+    return list(img.getdata())
+
+
+def is_flat_image(img: Image.Image, sample_width: int = 120, max_mean_adj_diff: float = 4.0) -> bool:
+    """Heuristic: True when the frame has little high-frequency detail (flat UI, smooth gradients).
+
+    Such frames are best encoded as LOSSLESS PNG – crisp text for the model and, measured on real
+    screen content, at least as small as a JPEG.  Noisy/photo/3D frames keep using JPEG.  The
+    metric is the mean absolute difference between adjacent pixels of a small NEAREST-sampled
+    copy (local variance): a solid panel scores ~0, a smooth gradient ~1-2, an app UI ~2-4,
+    while a photo, wallpaper noise or a rendered 3D scene scores > 4.  Deliberately NOT the
+    number of distinct colours: a noisy gradient has few colours yet produces a huge PNG.
+    """
+    try:
+        small = img.convert("RGB").resize(
+            (sample_width, max(1, round(sample_width * img.height / img.width))), Image.NEAREST)
+        px = _pixels(small)
+        w, h = small.size
+        total = 0
+        for y in range(h):
+            row = y * w
+            for x in range(w):
+                r, g, b = px[row + x]
+                if x + 1 < w:
+                    r2, g2, b2 = px[row + x + 1]
+                    total += abs(r - r2) + abs(g - g2) + abs(b - b2)
+                if y + 1 < h:
+                    r2, g2, b2 = px[row + x + w]
+                    total += abs(r - r2) + abs(g - g2) + abs(b - b2)
+        samples = 3 * (h * (w - 1) + (h - 1) * w)
+        return total / max(1, samples) <= max_mean_adj_diff
+    except Exception:  # pragma: no cover - heuristic must never break a capture
+        return False
+
 
 @dataclass
 class Screenshot:
@@ -30,7 +103,10 @@ class Screenshot:
     taken_at: float = field(default_factory=time.time)
     fmt: str = "jpeg"
     quality: int = 70
+    subsampling: int = 0           # JPEG chroma subsampling: 0=4:4:4 (best), 1=4:2:2, 2=4:2:0
     is_region: bool = False        # zoomed detail does not replace the executor's full-screen click frame
+    phash: str = ""                # 256-bit average hash of the RAW capture (duplicate detection)
+    render_sig: str = ""           # encoding/annotation settings; a duplicate must match both pixels AND this
     _encoded: Optional[bytes] = field(default=None, repr=False)
     frame_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     all_screens: bool = False
@@ -97,9 +173,12 @@ class Screenshot:
         if self._encoded is None:
             buf = io.BytesIO()
             if self.fmt == "png":
-                self.image.save(buf, format="PNG", optimize=True)
+                # PNG for flat UI screens: strong, lossless compression only – quality never drops.
+                self.image.save(buf, format="PNG", optimize=True, compress_level=9)
             else:
-                self.image.convert("RGB").save(buf, format="JPEG", quality=self.quality, optimize=True)
+                # subsampling=0 (4:4:4) keeps full chroma quality; 1/2 are optional size savers.
+                self.image.convert("RGB").save(buf, format="JPEG", quality=self.quality,
+                                               optimize=True, subsampling=self.subsampling)
             self._encoded = buf.getvalue()
         return self._encoded
 
@@ -174,6 +253,35 @@ def draw_cursor(img: Image.Image, x: int, y: int, color=(255, 255, 0)) -> Image.
     return out
 
 
+def render_signature(raw_size: tuple[int, int], *, max_width: Optional[int], fmt: str, quality: int,
+                     subsampling: int, grid: bool, grid_spacing: int, cursor: bool,
+                     coordinate_space: str = "image_pixels") -> str:
+    """Fingerprint of the rendering settings applied to a capture.
+
+    A frame is only a *duplicate* of another when pixels AND rendering match: coordinates are
+    defined in the image's pixel grid, so a width/format/grid/coordinate-space change is a new
+    frame even when the screen pixels did not change.
+    """
+    raw_w, raw_h = raw_size
+    img_w = raw_w if (max_width is None or raw_w <= max_width) else max_width
+    img_h = max(1, int(round(raw_h * img_w / raw_w))) if img_w != raw_w else raw_h
+    return (f"{img_w}x{img_h}|{fmt}|{quality}|{subsampling}|grid={grid}|{grid_spacing}|cursor={cursor}"
+            f"|space={coordinate_space}")
+
+
+def resolve_format(raw: Image.Image, fmt: str) -> str:
+    """Resolve 'auto' to a concrete format: lossless PNG for flat/smooth screens, JPEG otherwise.
+
+    Both options keep the same sharpness contract (JPEG quality is never lowered here); 'auto'
+    only picks whichever encodes the current screen best.
+    """
+    if fmt in ("jpeg", "png"):
+        return fmt
+    if fmt == "auto":
+        return "png" if is_flat_image(raw) else "jpeg"
+    raise ValueError(f"Unknown screenshot format: {fmt!r} (expected auto, jpeg or png)")
+
+
 def prepare_screenshot(
     raw: Image.Image,
     *,
@@ -182,12 +290,14 @@ def prepare_screenshot(
     grid: bool = True,
     grid_spacing: int = 100,
     cursor: Optional[tuple[int, int]] = None,
-    fmt: str = "jpeg",
+    fmt: str = "auto",
     quality: int = 70,
+    subsampling: int = 0,
     coordinate_space: str = "image_pixels",
 ) -> Screenshot:
     """Scale, annotate and wrap a raw capture."""
     raw_w, raw_h = raw.size
+    fmt = resolve_format(raw, fmt)
     scale = 1.0
     img = raw
     if max_width is not None and raw_w > max_width:
@@ -197,7 +307,11 @@ def prepare_screenshot(
         img = img.convert("RGB")
     origin = (geometry.left, geometry.top) if geometry else (0, 0)
     shot = Screenshot(image=img, raw_size=(raw_w, raw_h), scale=scale, origin=origin, fmt=fmt, quality=quality,
-                      coordinate_space=coordinate_space)
+                      subsampling=subsampling, coordinate_space=coordinate_space,
+                      phash=average_hash(raw),
+                      render_sig=render_signature((raw_w, raw_h), max_width=max_width, fmt=fmt, quality=quality,
+                                                  subsampling=subsampling, grid=grid, grid_spacing=grid_spacing,
+                                                  cursor=cursor is not None, coordinate_space=coordinate_space))
     if cursor is not None and (origin[0] <= cursor[0] < origin[0] + raw_w and origin[1] <= cursor[1] < origin[1] + raw_h):
         cx, cy = shot.to_image(*cursor)
         # Rounding a physical edge pixel can produce image.width/height after downscaling.

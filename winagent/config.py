@@ -27,7 +27,7 @@ ENV_OVERRIDES = {
 
 TOOL_PROTOCOLS = ("auto", "native", "json")
 BACKENDS = ("auto", "windows", "fake")
-SCREENSHOT_FORMATS = ("jpeg", "png")
+SCREENSHOT_FORMATS = ("auto", "jpeg", "png")
 COORDINATE_SPACES = ("image_pixels", "normalized_1000")
 # What the GUI does with its own window while the agent is working:
 #   overlay  - minimise the main window and show a small always-on-top status overlay (default)
@@ -93,6 +93,8 @@ class Config:
     mouse_failsafe: bool = True          # moving the mouse to the top-left corner aborts the task
     response_language: str = "auto"      # auto | fa | en | ...
     extra_system_prompt: str = ""
+    preferred_keyboard_layout: str = "en-US"  # layout switched to before keyboard input (e.g. en-US, fa-IR)
+    auto_fix_keyboard_layout: bool = True     # check the active input language and correct it when wrong
 
     # --- Screenshots -----------------------------------------------------------
     coordinate_space: str = "image_pixels"  # explicit contract; NEVER inferred from model name or coordinate values
@@ -101,8 +103,10 @@ class Config:
     screenshot_grid: bool = True
     screenshot_grid_spacing: int = 100
     screenshot_show_cursor: bool = True
-    screenshot_format: str = "jpeg"      # jpeg | png
+    screenshot_format: str = "auto"      # auto (lossless PNG for flat UIs, JPEG for photo/3D content) | jpeg | png
     screenshot_jpeg_quality: int = 70
+    dedupe_screenshots: bool = True      # do not re-send a full frame identical to the previous one
+    screenshot_jpeg_subsampling: int = 0  # 0=4:4:4 (best quality, default) | 1=4:2:2 | 2=4:2:0 (smallest)
 
     # --- Misc --------------------------------------------------------------------
     backend: str = "auto"                # auto | windows | fake
@@ -151,6 +155,8 @@ class Config:
             problems.append("max_response_retries must be between 0 and 10.")
         if self.screenshot_max_width < 320:
             problems.append("screenshot_max_width must be >= 320.")
+        if not (0 <= self.screenshot_jpeg_subsampling <= 2):
+            problems.append("screenshot_jpeg_subsampling must be 0 (4:4:4), 1 (4:2:2) or 2 (4:2:0).")
         if not (0.0 <= self.temperature <= 2.0):
             problems.append("temperature must be between 0 and 2.")
         return problems

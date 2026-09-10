@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 _FRAME_FIELDS = {
     "coordinate_mapping", "pointer_after_action", "screenshot", "screenshot_frame", "screenshot_frame_id",
     "coordinate_space", "mouse", "mouse_physical", "mouse_screenshot", "screenshot_rect", "screenshot_center",
+    "screen_unchanged",
 }
 _POINTER_TOOLS = {"mouse_move", "click", "double_click", "right_click", "drag", "scroll"}
 
@@ -54,6 +55,8 @@ def result_record(result: ToolResult) -> dict[str, Any] | None:
         data = {}
     else:
         data = _compact(result.data)
+        if isinstance(data, dict) and result.data.get("screen_unchanged"):
+            data.pop("note", None)  # an "unchanged" note embeds a frame id – pure old-frame state
     record: dict[str, Any] = {"tool": name, "ok": result.ok}
     if args:
         record["arguments"] = _compact(args)

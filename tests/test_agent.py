@@ -1,5 +1,7 @@
 import json
 
+from PIL import ImageDraw
+
 from tests.conftest import ScriptedLLM, native_tool_message
 from winagent.agent import Agent, AgentEvents
 from winagent.llm import LLMError
@@ -188,8 +190,21 @@ def test_llm_error_is_reported(config, backend):
     assert "401" in outcome.message and errors
 
 
-def test_image_trimming_keeps_only_recent_screenshots(config, backend):
+def test_image_trimming_keeps_only_recent_screenshots(config, backend, monkeypatch):
     config.max_images_in_context = 2
+    # Make every capture visibly different (half the screen recoloured) so duplicate suppression
+    # stays off and each round really produces a new frame for the trimming logic to act on.
+    state = {"n": 0}
+    original = backend.capture
+
+    def capture(**kwargs):
+        state["n"] += 1
+        img = original(**kwargs)
+        fill = (230, 20, 20) if state["n"] % 2 else (20, 20, 230)
+        ImageDraw.Draw(img).rectangle([800, 0, 1600, 900], fill=fill)
+        return img
+
+    monkeypatch.setattr(backend, "capture", capture)
     llm = ScriptedLLM([
         native_tool_message(("click", {"x": 1, "y": 1})),
         native_tool_message(("click", {"x": 2, "y": 2})),

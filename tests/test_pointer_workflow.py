@@ -79,7 +79,25 @@ def test_actions_that_change_ui_still_capture_their_result(config, backend, name
     frame = executor.take_screenshot()
     result = executor.execute(ToolCall(name, args))
     assert result.ok, result.error
+    # The auto-capture still runs after the action. On the simulated desktop these actions only
+    # move the cursor (no window under the pointer), so the perceptually unchanged frame is
+    # reused instead of being re-sent as a duplicate image.
+    assert result.screenshot is not None
+    if result.screenshot is frame:
+        assert result.data.get("screen_unchanged") is True
+        assert "no new image" in result.data.get("note", "")
+    assert executor.screenshot_count == 2
+
+
+def test_ui_change_after_action_yields_a_fresh_frame(config, backend):
+    assert config.auto_screenshot_after_action
+    executor = ToolExecutor(backend, config)
+    frame = executor.take_screenshot()
+    # clicking the fake Start button opens the large Start-menu window: a real, large screen change
+    result = executor.execute(ToolCall("click", {"x": 20, "y": 440}))
+    assert result.ok, result.error
     assert result.screenshot is not None and result.screenshot is not frame
+    assert result.data.get("screen_unchanged") is not True
     assert executor.screenshot_count == 2
 
 

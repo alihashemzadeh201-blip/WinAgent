@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import BACKENDS, COORDINATE_SPACES, GUI_MODES, OVERLAY_CORNERS, SCREENSHOT_FORMATS, TOOL_PROTOCOLS, Config
+from ..config import BACKENDS, COORDINATE_SPACES, GUI_MODES, OVERLAY_CORNERS, TOOL_PROTOCOLS, Config
 from ..llm import LLMClient, LLMError
 
 GUI_MODE_LABELS = {
@@ -160,6 +160,20 @@ class SettingsDialog(QDialog):
         self.max_images = QSpinBox()
         self.max_images.setRange(1, 20)
         aform.addRow("Screenshots kept in context", self.max_images)
+        self.preferred_layout = QComboBox()
+        self.preferred_layout.setEditable(True)
+        self.preferred_layout.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.preferred_layout.addItems(["en-US", "en-GB", "fa-IR", "de-DE", "fr-FR", "ar-SA", "tr-TR",
+                                        "ru-RU", "it-IT", "es-ES", "pt-BR", "ja-JP", "zh-CN", "ko-KR"])
+        self.preferred_layout.setToolTip("Input language the agent switches to before keyboard input (needed for "
+                                         "letter shortcuts and menu mnemonics). The active layout is checked "
+                                         "before every key press.")
+        aform.addRow("Preferred keyboard layout", self.preferred_layout)
+        self.auto_fix_layout = QCheckBox("Check and auto-correct the keyboard layout before key input")
+        self.auto_fix_layout.setToolTip("Before pressing keys, the agent checks the active input language of the "
+                                        "foreground window and switches it to the preferred layout when it differs "
+                                        "(e.g. Persian -> English). type_text is unaffected (Unicode injection).")
+        aform.addRow("", self.auto_fix_layout)
         self.max_history = QSpinBox()
         self.max_history.setRange(10, 1000)
         aform.addRow("Max history messages", self.max_history)
@@ -226,11 +240,29 @@ class SettingsDialog(QDialog):
         self.shot_cursor = QCheckBox("Mark the mouse cursor")
         sform.addRow("", self.shot_cursor)
         self.shot_format = QComboBox()
-        self.shot_format.addItems(SCREENSHOT_FORMATS)
+        self.shot_format.addItem("Auto – lossless PNG for flat UI screens, JPEG for photo/3D content", "auto")
+        self.shot_format.addItem("JPEG", "jpeg")
+        self.shot_format.addItem("PNG (lossless)", "png")
+        self.shot_format.setToolTip("Auto keeps the same quality and picks whichever encoding is best for the "
+                                    "current screen: flat UI screens are sent as lossless PNG (crisp text, usually "
+                                    "smaller), photo/3D content as JPEG. Quality is never lowered automatically.")
         sform.addRow("Format", self.shot_format)
         self.shot_quality = QSpinBox()
         self.shot_quality.setRange(30, 100)
         sform.addRow("JPEG quality", self.shot_quality)
+        self.shot_subsampling = QComboBox()
+        self.shot_subsampling.addItem("4:4:4 – best quality (default)", 0)
+        self.shot_subsampling.addItem("4:2:2 – smaller, imperceptible loss", 1)
+        self.shot_subsampling.addItem("4:2:0 – smallest (still no blur)", 2)
+        self.shot_subsampling.setToolTip("JPEG chroma subsampling. 4:4:4 keeps full colour accuracy; 4:2:2/4:2:0 "
+                                         "shrink the file with no visible quality loss for screenshots. "
+                                         "Quality (above) is never lowered automatically.")
+        sform.addRow("JPEG chroma subsampling", self.shot_subsampling)
+        self.shot_dedupe = QCheckBox("Skip re-sending unchanged screenshots (saves tokens & time)")
+        self.shot_dedupe.setToolTip("When the screen is identical to the previous full screenshot (a blinking cursor "
+                                    "or clock tick is still 'unchanged'), the duplicate image is not sent to the "
+                                    "model again; the tool result says the screen is unchanged instead.")
+        sform.addRow("", self.shot_dedupe)
         tabs.addTab(shots, "Screenshots")
 
         # --- Safety ------------------------------------------------------------
@@ -296,6 +328,8 @@ class SettingsDialog(QDialog):
         self.auto_screenshot.setChecked(cfg.auto_screenshot_after_action)
         self.action_delay.setValue(cfg.action_delay)
         self.max_images.setValue(cfg.max_images_in_context)
+        self.preferred_layout.setEditText(cfg.preferred_keyboard_layout or "en-US")
+        self.auto_fix_layout.setChecked(cfg.auto_fix_keyboard_layout)
         self.max_history.setValue(cfg.max_history_messages)
         self.response_language.setEditText(cfg.response_language)
         idx = self.gui_mode.findData(cfg.gui_mode_while_running)
@@ -311,8 +345,10 @@ class SettingsDialog(QDialog):
         self.shot_grid.setChecked(cfg.screenshot_grid)
         self.shot_grid_spacing.setValue(cfg.screenshot_grid_spacing)
         self.shot_cursor.setChecked(cfg.screenshot_show_cursor)
-        self.shot_format.setCurrentText(cfg.screenshot_format)
+        self.shot_format.setCurrentIndex(max(0, self.shot_format.findData(cfg.screenshot_format)))
         self.shot_quality.setValue(cfg.screenshot_jpeg_quality)
+        self.shot_subsampling.setCurrentIndex(max(0, self.shot_subsampling.findData(cfg.screenshot_jpeg_subsampling)))
+        self.shot_dedupe.setChecked(cfg.dedupe_screenshots)
         self.confirm_dangerous.setChecked(cfg.confirm_dangerous_actions)
         self.allow_shell.setChecked(cfg.allow_shell_commands)
         self.allow_file_write.setChecked(cfg.allow_file_write)
@@ -359,6 +395,8 @@ class SettingsDialog(QDialog):
         cfg.auto_screenshot_after_action = self.auto_screenshot.isChecked()
         cfg.action_delay = float(self.action_delay.value())
         cfg.max_images_in_context = int(self.max_images.value())
+        cfg.preferred_keyboard_layout = (self.preferred_layout.currentText() or "en-US").strip()
+        cfg.auto_fix_keyboard_layout = self.auto_fix_layout.isChecked()
         cfg.max_history_messages = int(self.max_history.value())
         cfg.response_language = self.response_language.currentText().strip() or "auto"
         cfg.gui_mode_while_running = str(self.gui_mode.currentData() or GUI_MODES[0])
@@ -371,8 +409,10 @@ class SettingsDialog(QDialog):
         cfg.screenshot_grid = self.shot_grid.isChecked()
         cfg.screenshot_grid_spacing = int(self.shot_grid_spacing.value())
         cfg.screenshot_show_cursor = self.shot_cursor.isChecked()
-        cfg.screenshot_format = self.shot_format.currentText()
+        cfg.screenshot_format = str(self.shot_format.currentData() or "auto")
         cfg.screenshot_jpeg_quality = int(self.shot_quality.value())
+        cfg.screenshot_jpeg_subsampling = int(self.shot_subsampling.currentData() or 0)
+        cfg.dedupe_screenshots = self.shot_dedupe.isChecked()
         cfg.confirm_dangerous_actions = self.confirm_dangerous.isChecked()
         cfg.allow_shell_commands = self.allow_shell.isChecked()
         cfg.allow_file_write = self.allow_file_write.isChecked()

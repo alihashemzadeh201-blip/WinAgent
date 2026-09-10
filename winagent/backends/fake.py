@@ -8,6 +8,7 @@ screenshot -> LLM -> action loop can be exercised without a real Windows box.
 
 from __future__ import annotations
 
+import copy
 import platform
 import subprocess
 import sys
@@ -36,6 +37,26 @@ FAKE_START_APPS: list[tuple[str, str]] = [
     ("Calculator", "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"), ("Settings", "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"),
     ("Microsoft Edge", "MSEdge"), ("Telegram Desktop", "TelegramDesktop"), ("Spotify", "Spotify"),
     ("Microsoft Store", "Microsoft.WindowsStore_8wekyb3d8bbwe!App"),
+]
+
+# Simulated classic menu bar of the fake apps (same node shape as WindowsBackend.menu_structure).
+FAKE_MENU_BAR: list[dict[str, Any]] = [
+    {"text": "File", "mnemonic": "f", "items": [
+        {"text": "New", "mnemonic": "n"}, {"text": "Open…", "mnemonic": "o"}, {"text": "Save", "mnemonic": "s"},
+        {"text": "Save As…", "mnemonic": "a"}, {"separator": True},
+        {"text": "Export", "mnemonic": "e", "items": [
+            {"text": "Export as PDF…", "mnemonic": "p"},
+            {"text": "Export as Image…", "mnemonic": "i"},
+        ]},
+        {"text": "Exit", "mnemonic": "x"}]},
+    {"text": "Edit", "mnemonic": "e", "items": [
+        {"text": "Undo", "mnemonic": "u"}, {"text": "Redo", "mnemonic": "r"}, {"separator": True},
+        {"text": "Cut", "mnemonic": "t"}, {"text": "Copy", "mnemonic": "c"}, {"text": "Paste", "mnemonic": "p"}]},
+    {"text": "View", "mnemonic": "v", "items": [
+        {"text": "Zoom In", "mnemonic": "i"}, {"text": "Zoom Out", "mnemonic": "o"},
+        {"text": "Toolbars", "mnemonic": "t", "items": [
+            {"text": "Show Toolbar", "mnemonic": "s"}, {"text": "Reset Toolbars", "mnemonic": "r"}]}]},
+    {"text": "Help", "mnemonic": "h", "items": [{"text": "About", "mnemonic": "a"}]},
 ]
 
 
@@ -90,6 +111,16 @@ class FakeBackend(DesktopBackend):
         self.launcher = Launcher(self.launch_env, strategies={"fake": self._fake_launch})
         self.blocked_programs: set[str] = set()   # exe names that fail with "access denied" (for tests)
         self.last_launch = None
+        self.fake_keyboard_layout = "en-US"       # simulated active input language
+        self.layout_changes: list[str] = []       # recorded set_keyboard_layout() calls
+        self.fake_open_popup: Optional[list[dict[str, Any]]] = None  # simulated open context menu
+        # Stateful simulation of keyboard menu navigation (same state machine the executor drives):
+        # fake_menu_stack = open popups (top last), fake_menu_typed = type-ahead buffer per popup.
+        self.fake_menu_stack: list[list[dict[str, Any]]] = []
+        self.fake_menu_typed: list[str] = []
+        self.fake_menu_bar_mode = False           # F10: navigating the menu bar itself
+        self.fake_menu_bar_typed = ""
+        self.menu_selections: list[str] = []      # texts selected via the keyboard menu flow (test hook)
         self._add_window("Desktop", "Progman-fake", 0, 0, width, height - 40, "explorer.exe")
 
     @staticmethod
@@ -215,14 +246,97 @@ class FakeBackend(DesktopBackend):
 
     # --------------------------------------------------------------- keyboard
     def type_text(self, text: str, interval: float = 0.0) -> None:
+        # Type-ahead characters go to the open menu (or menu-bar mode), not to the focused window.
+        if self.fake_menu_stack:
+            self.fake_menu_typed[-1] += text
+            self._log("type_menu", text=text)
+            return
+        if self.fake_menu_bar_mode:
+            self.fake_menu_bar_typed += text
+            self._log("type_menu_bar", text=text)
+            return
         self.typed.append(text)
         self._log("type", text=text)
+
+    @staticmethod
+    def _fake_menu_resolve(menu: list[dict[str, Any]], typed: str) -> Optional[dict[str, Any]]:
+        """The item a typed type-ahead prefix highlights (exact name, else unique prefix)."""
+        cands = [i for i in menu if not i.get("separator") and i.get("text")]
+        t = (typed or "").strip().lower()
+        if not t:
+            return None
+        for i in cands:
+            if i["text"].strip().lower() == t:
+                return i
+        pref = [i for i in cands if i["text"].strip().lower().startswith(t)]
+        return pref[0] if len(pref) == 1 else None
+
+    def _menu_keypress(self, canonical: list[str]) -> bool:
+        """Simulate a key while a menu is (or the menu bar is) active. True when the menu consumed it.
+
+        Mirrors Windows behaviour: Right opens the highlighted item's submenu, Enter confirms the
+        highlighted item and closes the menu, Esc closes one level / the whole menu.
+        """
+        if self.fake_menu_stack:
+            top = self.fake_menu_stack[-1]
+            if canonical == ["right"]:
+                target = self._fake_menu_resolve(top, self.fake_menu_typed[-1])
+                if target is not None and target.get("items"):
+                    self.fake_menu_stack.append([dict(i) for i in target["items"]])
+                    self.fake_menu_typed.append("")
+                return True
+            if canonical == ["enter"]:
+                target = self._fake_menu_resolve(top, self.fake_menu_typed[-1])
+                if target is not None:
+                    self.menu_selections.append(str(target.get("text")))
+                    self._log("menu_select", item=target.get("text"))
+                self.fake_menu_stack, self.fake_menu_typed = [], []
+                return True
+            if canonical == ["esc"]:
+                self.fake_menu_stack, self.fake_menu_typed = [], []
+                return True
+            return True  # everything else is consumed by the open menu
+
+        if self.fake_menu_bar_mode:
+            if canonical == ["enter"]:
+                win = self.active_window()
+                bar = (self.menu_structure(win.hwnd) if win is not None and win.class_name != "Progman-fake" else None) or []
+                target = self._fake_menu_resolve(bar, self.fake_menu_bar_typed)
+                self.fake_menu_bar_mode, self.fake_menu_bar_typed = False, ""
+                if target is not None and target.get("items"):
+                    self.fake_menu_stack = [[dict(i) for i in target["items"]]]
+                    self.fake_menu_typed = [""]
+                return True
+            if canonical == ["esc"]:
+                self.fake_menu_bar_mode, self.fake_menu_bar_typed = False, ""
+                return True
+            if len(canonical) == 1 and canonical[0].isalpha():
+                self.fake_menu_bar_typed += canonical[0]
+            return True
+
+        if len(canonical) == 2 and canonical[0] == "alt" and len(canonical[1]) == 1 and canonical[1].isalpha():
+            win = self.active_window()
+            bar = (self.menu_structure(win.hwnd) if win is not None and win.class_name != "Progman-fake" else None) or []
+            for node in bar:
+                if (node.get("mnemonic") or "").lower() == canonical[1].lower() and node.get("items"):
+                    self.fake_menu_stack = [[dict(i) for i in node["items"]]]
+                    self.fake_menu_typed = [""]
+                    self._log("menu_open", item=node.get("text"))
+                    return True
+            return True  # Alt+letter with no matching menu is consumed (no-op)
+        if canonical == ["f10"]:
+            self.fake_menu_bar_mode = True
+            self.fake_menu_bar_typed = ""
+            return True
+        return False
 
     def press_keys(self, keys: list[str], repeat: int = 1) -> None:
         canonical = [normalize_key(k) for k in keys]
         for _ in range(max(1, repeat)):
             self.pressed.append(canonical)
         self._log("keys", keys=canonical, repeat=repeat)
+        if self._menu_keypress(canonical):
+            return
         if canonical == ["enter"]:
             self.typed.append("\n")
         elif canonical == ["backspace"] and self.typed:
@@ -364,6 +478,37 @@ class FakeBackend(DesktopBackend):
     def clipboard_set(self, text: str) -> None:
         self.clipboard = text
         self._log("clipboard", text=text)
+
+    # ----------------------------------------------- keyboard layout / input
+    def active_keyboard_layout(self) -> str:
+        return self.fake_keyboard_layout
+
+    def set_keyboard_layout(self, name: str) -> str:
+        self.layout_changes.append(name)
+        self.fake_keyboard_layout = name
+        self._log("layout", layout=name)
+        return self.fake_keyboard_layout
+
+    # ------------------------------------------------------------------- menus
+    def menu_structure(self, hwnd: Optional[int] = None) -> Optional[list[dict[str, Any]]]:
+        if hwnd is None:
+            win = self.active_window()
+            if win is None or win.class_name == "Progman-fake":
+                return None
+        else:
+            try:
+                win = self._get(hwnd)
+            except BackendError:
+                return None
+            if win.class_name == "Progman-fake":
+                return None
+        return copy.deepcopy(FAKE_MENU_BAR)
+
+    def open_menu_items(self) -> list[dict[str, Any]]:
+        """Topmost open popup: the keyboard menu stack first, then a static context menu."""
+        if self.fake_menu_stack:
+            return [dict(i) for i in self.fake_menu_stack[-1]]
+        return [dict(i) for i in (self.fake_open_popup or [])]
 
     # ------------------------------------------------------------------- misc
     def system_info(self) -> dict[str, Any]:

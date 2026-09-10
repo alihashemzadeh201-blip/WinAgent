@@ -12,7 +12,9 @@ callbacks so the same core drives the Qt GUI and the command line.
 from __future__ import annotations
 
 import copy
+import json
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -43,6 +45,9 @@ from .tools import ToolExecutor, ToolResult
 from .tools.definitions import openai_tool_schemas
 
 log = logging.getLogger(__name__)
+
+# frame id as embedded by Screenshot.describe() ("frame <12 hex chars>")
+_FRAME_ID_RE = re.compile(r"frame ([0-9a-f]{12})")
 
 
 @dataclass
@@ -85,6 +90,12 @@ class Agent:
         self.history: list[dict[str, Any]] = []   # chat history WITHOUT the system prompt
         self._model_frame: Optional[Screenshot] = None  # last FULL image actually included in a model request
         self._image_slots: list[int] = []          # indexes of history messages that carry images
+        self._image_frames: list[tuple[int, str]] = []  # (message index, frame_id) of attached images
+        self._stall_sig: Any = None               # bucketed action signature of the last round
+        self._stall_count = 0                     # consecutive rounds repeating that state with no progress
+        self._stall_tool: Optional[str] = None    # single tool name of the last round (any target)
+        self._stall_tool_count = 0                # consecutive no-progress rounds using that tool
+        self._stall_warned = False                # warning already injected for the current stall
         self.protocol = self._initial_protocol()
         self.vision = bool(config.vision_enabled)
         # Raw execution history is retained for inspection until the next request. Only a factual,
@@ -110,6 +121,7 @@ class Agent:
         with self._lock:
             self.history.clear()
             self._image_slots.clear()
+            self._image_frames.clear()
             self.executor.last_screenshot = None
             self._model_frame = None
             self._followup_history = None
@@ -117,6 +129,14 @@ class Agent:
             self._request_index = 0
             self._has_progress_note = False
             self._task_records = []
+            self._reset_stall()
+
+    def _reset_stall(self) -> None:
+        self._stall_sig = None
+        self._stall_count = 0
+        self._stall_tool = None
+        self._stall_tool_count = 0
+        self._stall_warned = False
 
     def followup_history(self) -> list[dict[str, Any]]:
         """Copy the conversation handoff, never old live tool calls, when starting/rebuilding a task."""
@@ -135,6 +155,9 @@ class Agent:
             info = self.backend.system_info()
         except Exception as exc:  # pragma: no cover
             info = {"note": f"system info unavailable: {exc}"}
+        # Surface the agent's own layout policy to the model alongside the machine facts.
+        info["preferred_keyboard_layout"] = self.config.preferred_keyboard_layout
+        info["auto_fix_keyboard_layout"] = self.config.auto_fix_keyboard_layout
         prompt = build_system_prompt(protocol=self.protocol, vision=self.vision, system_info=info,
                                      language=self.config.response_language, extra=self.config.extra_system_prompt,
                                      coordinate_space=coordinate_space or self.config.coordinate_space)
@@ -181,14 +204,38 @@ class Agent:
         if self._has_progress_note:
             self.history[self._request_index + 1] = progress_message(self._task_records)
         self._image_slots = [i for i, msg in enumerate(self.history) if _has_image(msg)]
+        self._resync_image_frames()
 
-    def _user_message(self, text: str, shot: Optional[Screenshot] = None) -> dict[str, Any]:
+    def _resync_image_frames(self) -> None:
+        """Rebuild the (index, frame_id) table of images currently attached in the history.
+
+        The frame id is part of every screenshot description text, so an image whose message
+        survived trimming is known by id; once its message is gone, the same frame may be
+        attached again if the screen needs to be shown.
+        """
+        frames: list[tuple[int, str]] = []
+        for i, msg in enumerate(self.history):
+            if _has_image(msg):
+                match = _FRAME_ID_RE.search(_message_text(msg))
+                if match:
+                    frames.append((i, match.group(1)))
+        self._image_frames = frames
+
+    def _attached_frame_ids(self) -> set[str]:
+        return {fid for _, fid in self._image_frames}
+
+    def _user_message(self, text: str, shot: Optional[Screenshot] = None) -> tuple[dict[str, Any], bool]:
+        """Build a user message, skipping a duplicate image already present in the context."""
         if shot is not None and self.vision:
+            if not shot.is_region and shot.frame_id in self._attached_frame_ids():
+                note = (f"\n[No new image attached: the screen is unchanged and full frame {shot.frame_id} "
+                        "is already in the context, so the identical image was not duplicated.]")
+                return {"role": "user", "content": text_part(text + note)}, False
             image = image_part(shot.data_url())
             if not shot.is_region:
                 self._model_frame = shot
-            return {"role": "user", "content": [text_part(text), image]}
-        return {"role": "user", "content": text}
+            return {"role": "user", "content": [text_part(text), image]}, True
+        return {"role": "user", "content": text}, False
 
     # ------------------------------------------------------------------ run
     def run(self, task: str, *, initial_screenshot: bool = True) -> RunOutcome:
@@ -208,7 +255,9 @@ class Agent:
         self._request_index = len(self.history)
         self._has_progress_note = False
         self._task_records = []
+        self._reset_stall()
         self._image_slots = [i for i, msg in enumerate(self.history) if _has_image(msg)]
+        self._resync_image_frames()
         # No image from a previous request is a current coordinate frame. A failed/disabled
         # initial capture must not silently reuse the old desktop or its completion state.
         self._model_frame = None
@@ -230,7 +279,12 @@ class Agent:
             elif capture_error:
                 text += ("\n\n[No current screenshot is available. Do not use coordinates from a previous request. "
                          f"Request a fresh screenshot or use non-pointer tools. Capture error: {capture_error[:500]}]")
-            self._append(self._user_message(text, shot), has_image=shot is not None)
+            # Check (and, when enabled, correct) the input language BEFORE any action of this task.
+            layout_note = self._initial_layout_note()
+            if layout_note:
+                text += f"\n{layout_note}"
+            user_msg, has_image = self._user_message(text, shot)
+            self._append(user_msg, has_image=has_image)
 
             while True:
                 if self.stop_event.is_set():
@@ -319,6 +373,7 @@ class Agent:
                     continue
 
                 self._append_results(results)
+                self._update_stall(turn, results)
 
                 if finished is not None:
                     summary = finished.data.get("summary", "Done.")
@@ -360,6 +415,26 @@ class Agent:
         return outcome
 
     # ------------------------------------------------------------ internals
+    def _initial_layout_note(self) -> str:
+        """Verify the input language before doing anything; correct it when the setting is on.
+
+        The check runs for EVERY task, before the first action. When the layout is already the
+        preferred one the check is silent (no noise in the context); when it is wrong, the layout
+        is fixed first (if enabled) and a short [Input language check ...] line is appended to the
+        task's first message so the model knows what happened.
+        """
+        preferred = (self.config.preferred_keyboard_layout or "").strip()
+        if not preferred or preferred.lower() in ("any", "auto", "off"):
+            return ""
+        try:
+            active = self.backend.active_keyboard_layout()
+        except Exception:  # pragma: no cover - backend without layout support
+            return ""
+        if not active or active == "unknown" or active.lower() == preferred.lower():
+            return ""
+        note = self.executor._ensure_keyboard_layout() or "mismatch detected"
+        return f"[Input language check before any action: {note}]"
+
     def _append_results(self, results: list[ToolResult]) -> None:
         """Add tool results (and the newest screenshot) to the history."""
         latest_shot: Optional[Screenshot] = None
@@ -376,17 +451,71 @@ class Agent:
             # orphan results or assistant calls without replies at the next HTTP request.
             self.history.extend(tool_result_message_native(r.call, r.to_text()) for r in results)
             if latest_shot is not None and self.vision:
-                self.history.append(self._user_message(f"[Screenshot after the actions above. {latest_shot.describe()}]", latest_shot))
-                self._image_slots.append(len(self.history) - 1)
+                shot_msg, has_image = self._user_message(f"[Screenshot after the actions above. {latest_shot.describe()}]", latest_shot)
+                self.history.append(shot_msg)
+                if has_image:
+                    self._image_slots.append(len(self.history) - 1)
             self._trim()
         else:
             msg = tool_results_message_json([(r.call, r.to_text()) for r in results])
             if latest_shot is not None and self.vision:
-                msg["content"] = [text_part(msg["content"] + f"\n[Screenshot after the actions above. {latest_shot.describe()}]"),
-                                  image_part(latest_shot.data_url())]
-                self._append(msg, has_image=True)
+                base_text = msg["content"] + f"\n[Screenshot after the actions above. {latest_shot.describe()}]"
+                if not latest_shot.is_region and latest_shot.frame_id in self._attached_frame_ids():
+                    base_text += (f" [No new image: the screen is unchanged and full frame {latest_shot.frame_id} "
+                                  "is already in the context, so the identical image was not duplicated.]")
+                    msg["content"] = text_part(base_text)
+                    self._append(msg, has_image=False)
+                else:
+                    msg["content"] = [text_part(base_text), image_part(latest_shot.data_url())]
+                    self._append(msg, has_image=True)
             else:
                 self._append(msg)
+
+    def _update_stall(self, turn: AssistantTurn, results: list[ToolResult]) -> None:
+        """Detect repeated actions with no visible effect and tell the model to change course.
+
+        A round "stalls" when it repeats the previous round's action signature while the screen is
+        unchanged (per duplicate detection) or every call errored. Pointer coordinates are bucketed
+        into 16-unit cells so a few pixels of jitter still count as the SAME stuck action (the model
+        often "retries" a dead click at slightly different pixels), and a second counter watches the
+        same single tool used with ANY target. After a few consecutive stalls we inject a one-time
+        warning: change approach, or skip the step when it is genuinely impossible.
+        """
+        calls = turn.tool_calls
+        if not calls:
+            self._reset_stall()
+            return
+        sig = _stall_signature(calls)
+        unchanged = any(r.data.get("screen_unchanged") for r in results)
+        failed = bool(results) and all(not r.ok for r in results) and any(r.error for r in results)
+        no_progress = bool(unchanged or failed)
+        if self._stall_sig == sig and no_progress:
+            self._stall_count += 1
+        else:
+            self._stall_sig, self._stall_count = sig, 1
+        if no_progress and len(calls) == 1:
+            if self._stall_tool == calls[0].name:
+                self._stall_tool_count += 1
+            else:
+                self._stall_tool, self._stall_tool_count = calls[0].name, 1
+        else:
+            self._stall_tool, self._stall_tool_count = None, 0
+        if not no_progress:
+            self._stall_warned = False
+        if (self._stall_count >= 3 or self._stall_tool_count >= 4) and not self._stall_warned:
+            self._stall_warned = True
+            names = ", ".join(dict.fromkeys(c.name for c in calls))
+            count = max(self._stall_count, self._stall_tool_count)
+            self.history.append({"role": "user", "content": (
+                f"[Stall detected: {names} has now been attempted {count} times in a row with NO visible "
+                "change on the screen (or failing every time). Repeating it will not work – do NOT call "
+                "the same action again. If you are clicking a control that might be disabled/greyed "
+                "(e.g. a disabled combo box), it will never respond: verify with get_window_controls "
+                "('enabled') or a zoomed screenshot, then use a different route (the `menu` tool, a "
+                "keyboard shortcut, run_command, open_app) or SKIP this sub-step and continue with the "
+                "rest of the task. Finish with task_complete and an honest summary (success=false if "
+                "the goal was not reached), or use ask_user if the user must intervene.]")})
+            self.events.on_status("Repeated action without visible change – asking the model to change approach.")
 
     def _call_model(self, *, coordinate_space: Optional[str] = None, task_in_progress: bool = False) -> AssistantTurn:
         """Negotiate capabilities and recover bad output BEFORE committing any tool calls to history.
@@ -506,11 +635,67 @@ class Agent:
             converted.append(tool_results_message_json(pending))
         self.history = converted
         self._image_slots = [i for i in range(len(self.history)) if _has_image(self.history[i])]
+        self._resync_image_frames()
 
     def _disable_vision(self) -> None:
         self.vision = False
         self.history = [_strip_images(m) for m in self.history]
         self._image_slots = []
+        self._image_frames = []
+
+
+# Pointer argument keys that _stall_signature buckets (16-unit cells): the model often "retries" a
+# dead click a few pixels off; that must still count as the SAME stuck action, not a new one.
+_STALL_POINTERS = {
+    "mouse_move": ("x", "y"),
+    "click": ("x", "y"),
+    "double_click": ("x", "y"),
+    "right_click": ("x", "y"),
+    "drag": ("x1", "y1", "x2", "y2"),
+    "scroll": ("x", "y"),
+}
+_STALL_BUCKET = 16
+
+
+def _stall_bucket(value: Any) -> Optional[int]:
+    try:
+        return int(round(float(value))) // _STALL_BUCKET
+    except (TypeError, ValueError):
+        return None
+
+
+def _stall_signature(calls: list[ToolCall]) -> tuple:
+    """Round's action identity with jitter-proof pointer coordinates."""
+    sigs = []
+    for c in calls:
+        args = c.arguments or {}
+        keys = _STALL_POINTERS.get(c.name)
+        if keys is not None:
+            buckets = tuple(_stall_bucket(args.get(k)) for k in keys)
+            extra: dict[str, Any] = {}
+            if c.name == "scroll":
+                try:
+                    amount = int(args.get("amount") or 0)
+                except (TypeError, ValueError):
+                    amount = 0
+                extra["amount_sign"] = (amount > 0) - (amount < 0)
+                extra["direction"] = str(args.get("direction") or "vertical").lower()
+            elif c.name in ("click", "double_click", "right_click"):
+                extra["button"] = str(args.get("button") or "left").lower()
+                extra["clicks"] = args.get("clicks", 1)
+            sigs.append((c.name, buckets, json.dumps(extra, sort_keys=True)))
+        else:
+            sigs.append((c.name, (), json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)))
+    return tuple(sorted(sigs))
+
+
+def _message_text(msg: dict[str, Any]) -> str:
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+    return ""
 
 
 def _has_image(msg: dict[str, Any]) -> bool:

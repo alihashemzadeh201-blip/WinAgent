@@ -31,6 +31,7 @@ def test_executor_has_handler_for_every_tool(backend, config):
 
 
 def test_screenshot_scaling_and_coordinate_mapping(backend, config):
+    config.screenshot_format = "jpeg"  # explicit format: the mapping test must not depend on auto-detection
     ex = make_executor(backend, config)
     res = ex.execute(ToolCall("screenshot", {}))
     assert res.ok

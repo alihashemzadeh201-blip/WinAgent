@@ -111,6 +111,14 @@ GMEM_MOVEABLE = 0x0002
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 MOD_NOREPEAT = 0x4000
 
+KLF_ACTIVATE = 0x00000001
+
+MIIM_STRING = 0x00000001
+MIIM_SUBMENU = 0x00000004
+MIIM_STATE = 0x00000008
+MF_SEPARATOR = 0x08000000
+MF_GRAYED = 0x00000001
+
 # Keys for which the "extended" flag must be set in keyboard input.
 EXTENDED_VKS = {
     0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,  # pgup pgdn end home arrows
@@ -124,6 +132,8 @@ EXTENDED_VKS = {
 }
 
 ULONG_PTR = ctypes.c_size_t
+# Pointer-sized unsigned int for struct fields (wintypes.UINT_PTR exists only in Python 3.13+).
+c_void_ptr = getattr(wintypes, "UINT_PTR", None) or ctypes.c_void_p
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -164,6 +174,23 @@ class INPUT(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
 
 
+class MENUITEMINFO(ctypes.Structure):
+    # dwItemData is ULONG_PTR (pointer sized); c_void_p is portable across Python versions.
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("fMask", wintypes.UINT),
+        ("fType", wintypes.UINT),
+        ("fState", wintypes.UINT),
+        ("wId", wintypes.UINT),
+        ("hbmpItem", wintypes.HBITMAP),
+        ("hSubMenu", wintypes.HMENU),
+        ("dwItemData", c_void_ptr),
+        ("dwTypeData", wintypes.LPWSTR),
+        ("cch", wintypes.UINT),
+        ("stateBitMap", wintypes.UINT),
+    ]
+
+
 WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM) if IS_WINDOWS else \
     ctypes.CFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -173,6 +200,9 @@ LANGID_NAMES = {
     0x0411: "ja-JP", 0x0804: "zh-CN", 0x0412: "ko-KR", 0x0416: "pt-BR", 0x0413: "nl-NL",
     0x0420: "ur-PK", 0x0439: "hi-IN", 0x040D: "he-IL", 0x0415: "pl-PL", 0x0422: "uk-UA",
 }
+
+# Reverse lookup: preferred-layout name -> LANGID (for LoadKeyboardLayoutW).
+LAYOUT_IDS: dict[str, int] = {name: lid for lid, name in LANGID_NAMES.items()}
 
 
 def make_dpi_aware() -> None:
@@ -358,6 +388,18 @@ class WindowsBackend(DesktopBackend):
         u.EnumChildWindows.restype = wintypes.BOOL
         u.GetKeyboardLayout.argtypes = [wintypes.DWORD]
         u.GetKeyboardLayout.restype = wintypes.HKL
+        u.LoadKeyboardLayoutW.argtypes = [wintypes.LPCWSTR, wintypes.UINT]
+        u.LoadKeyboardLayoutW.restype = wintypes.HKL
+        u.ActivateKeyboardLayout.argtypes = [wintypes.HKL, wintypes.DWORD]
+        u.ActivateKeyboardLayout.restype = wintypes.HKL
+        u.GetMenu.argtypes = [wintypes.HWND]
+        u.GetMenu.restype = wintypes.HMENU
+        u.GetMenuItemCount.argtypes = [wintypes.HMENU]
+        u.GetMenuItemCount.restype = wintypes.INT
+        u.GetMenuItemInfoW.argtypes = [wintypes.HMENU, wintypes.UINT, wintypes.BOOL, ctypes.POINTER(MENUITEMINFO)]
+        u.GetMenuItemInfoW.restype = wintypes.BOOL
+        u.GetSubMenu.argtypes = [wintypes.HMENU, wintypes.UINT]
+        u.GetSubMenu.restype = wintypes.HMENU
         u.OpenClipboard.argtypes = [wintypes.HWND]
         u.OpenClipboard.restype = wintypes.BOOL
         u.CloseClipboard.argtypes = []
@@ -942,6 +984,122 @@ class WindowsBackend(DesktopBackend):
                 raise BackendError("SetClipboardData failed.")
         finally:
             self.user32.CloseClipboard()
+
+    # ----------------------------------------------- keyboard layout (input language)
+    def active_keyboard_layout(self) -> str:
+        """Input language of the FOREGROUND window's thread (what your next keystroke will use)."""
+        try:
+            fg = self.user32.GetForegroundWindow()
+            tid = self.user32.GetWindowThreadProcessId(fg, None) if fg else 0
+            hkl = int(self.user32.GetKeyboardLayout(tid) or 0) & 0xFFFF
+        except Exception:
+            return "unknown"
+        return LANGID_NAMES.get(hkl, hex(hkl))
+
+    def set_keyboard_layout(self, name: str) -> str:
+        """Activate a layout (e.g. 'en-US') for the foreground window; return the new active layout."""
+        key = (name or "").strip()
+        lid = LAYOUT_IDS.get(key) or LAYOUT_IDS.get(key.lower())
+        if lid is None:
+            match = re.fullmatch(r"0*x?([0-9a-fA-F]{4})", key)
+            if match:
+                lid = int(match.group(1), 16)
+            else:
+                raise BackendError(f"Unknown keyboard layout {name!r}. Known: {sorted(LAYOUT_IDS)}")
+        u = self.user32
+        hkl = u.LoadKeyboardLayoutW(f"{lid:08x}", KLF_ACTIVATE)
+        if not hkl:
+            raise BackendError(f"Could not load keyboard layout {name!r} (is it installed on this machine?).")
+        # Input lands on the FOREGROUND window's thread; attach so the activation reaches it.
+        fg = u.GetForegroundWindow()
+        tid = u.GetWindowThreadProcessId(fg, None) if fg else 0
+        cur = self.kernel32.GetCurrentThreadId()
+        if tid and tid != cur:
+            u.AttachThreadInput(cur, tid, True)
+            try:
+                u.ActivateKeyboardLayout(hkl, 0)
+            finally:
+                u.AttachThreadInput(cur, tid, False)
+        else:
+            u.ActivateKeyboardLayout(hkl, 0)
+        time.sleep(0.05)
+        return self.active_keyboard_layout()
+
+    # -------------------------------------------------------------------- menus
+    @staticmethod
+    def _mnemonic_of(label: str) -> str:
+        """Letter after the first real '&' in a menu label ('&&' is a literal), lowercase, or ''."""
+        i = 0
+        while i < len(label):
+            if label[i] == "&":
+                if i + 1 < len(label) and label[i + 1] == "&":
+                    i += 2
+                    continue
+                if i + 1 < len(label) and label[i + 1].isalpha():
+                    return label[i + 1].lower()
+            i += 1
+        return ""
+
+    def _menu_node(self, hmenu: int, depth: int, max_depth: int, limit: int) -> list[dict[str, Any]]:
+        u = self.user32
+        count = u.GetMenuItemCount(hmenu) or 0
+        items: list[dict[str, Any]] = []
+        for i in range(min(count, limit)):
+            buf = ctypes.create_unicode_buffer(260)
+            mi = MENUITEMINFO()
+            mi.cbSize = ctypes.sizeof(MENUITEMINFO)
+            mi.fMask = MIIM_STRING | MIIM_STATE | MIIM_SUBMENU
+            mi.dwTypeData = ctypes.cast(buf, wintypes.LPWSTR)
+            mi.cch = 259
+            if not u.GetMenuItemInfoW(hmenu, i, True, ctypes.byref(mi)):
+                continue
+            if mi.fType & MF_SEPARATOR:
+                items.append({"separator": True})
+                continue
+            text = (mi.dwTypeData.value if mi.dwTypeData else "") or ""
+            node: dict[str, Any] = {
+                "text": text.replace("&", "").strip(),
+                "mnemonic": self._mnemonic_of(text),
+                "enabled": not bool(mi.fState & MF_GRAYED),
+            }
+            sub = int(mi.hSubMenu or 0) if depth + 1 < max_depth else 0
+            if sub:
+                children = self._menu_node(sub, depth + 1, max_depth, limit)
+                if children:
+                    node["items"] = children
+            items.append(node)
+        return items
+
+    def menu_structure(self, hwnd: Optional[int] = None) -> Optional[list[dict[str, Any]]]:
+        if hwnd is None:
+            win = self.active_window()
+            if win is None:
+                return None
+            hwnd = win.hwnd
+        hmenu = self.user32.GetMenu(int(hwnd))
+        if not hmenu:
+            return None
+        return self._menu_node(int(hmenu), 0, 3, 80)
+
+    def open_menu_items(self) -> list[dict[str, Any]]:
+        """Items of the popup/context menu currently open (windows of class #32768), or []."""
+        handles: list[int] = []
+
+        @WNDENUMPROC
+        def _cb(hwnd, _lparam):
+            handles.append(int(hwnd))
+            return True
+
+        self.user32.EnumWindows(_cb, 0)
+        for h in reversed(handles):  # topmost first
+            if not self.user32.IsWindowVisible(h):
+                continue
+            if self._class_name(h) != "#32768":
+                continue
+            hmenu = self.user32.GetMenu(h)
+            if hmenu:
+                return self._menu_node(int(hmenu), 1, 3, 120)
+        return []
 
     # ------------------------------------------------------------------- misc
     def _windows_edition(self) -> dict[str, Any]:

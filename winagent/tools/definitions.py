@@ -108,7 +108,11 @@ TOOLS: list[ToolSpec] = [
     ),
     ToolSpec(
         name="drag",
-        description="Press the mouse button at (x1, y1), move to (x2, y2) and release. Use for selecting text, moving windows, drag-and-drop, drawing.",
+        description=(
+            "Press the mouse button at (x1, y1), move to (x2, y2) and release. Use for selecting text, moving windows, "
+            "drag-and-drop, drawing. In 3D viewports (Blender, 3ds Max, CAD) button='middle' ORBITS the camera around "
+            "the scene – use it to get a viewpoint where occluded objects are visible, then take a screenshot."
+        ),
         parameters=_obj({
             "x1": {"type": "integer"}, "y1": {"type": "integer"}, "x2": {"type": "integer"}, "y2": {"type": "integer"},
             "button": {"type": "string", "enum": ["left", "right", "middle"]},
@@ -120,7 +124,8 @@ TOOLS: list[ToolSpec] = [
         description=(
             "Scroll the mouse wheel at (x, y) (or at the current pointer position). "
             "`amount` is in wheel clicks: positive = scroll up / left, negative = scroll down / right. "
-            "Typical values: -5 to scroll down a bit, 10 to scroll up a page."
+            "Typical values: -5 to scroll down a bit, 10 to scroll up a page. In 3D viewports (Blender, 3ds Max) "
+            "the wheel zooms the camera."
         ),
         parameters=_obj({
             **_XY,
@@ -160,6 +165,30 @@ TOOLS: list[ToolSpec] = [
             "sequence": {"type": "array", "items": {"type": "string"}, "description": "List of key combinations pressed in order."},
             "delay": {"type": "number", "description": "Seconds between combinations (default 0.3)."},
         }, ["sequence"]), category="keyboard",
+    ),
+    ToolSpec(
+        name="menu",
+        description=(
+            "Work with application MENUS (menu bar, submenus, context menus) using the KEYBOARD only – never hover "
+            "or click with the mouse, because moving the pointer over an open menu dismisses submenus. "
+            "action='list': show the enumerable menu-bar structure of a window plus any popup menu that is currently "
+            "open (call this first to see the item names). "
+            "action='select' with path=[\"File\",\"Export\",\"PDF\"]: open the menu-bar item and walk the whole path "
+            "keyboard-only – Alt+mnemonic to open, type-ahead to highlight each item, the Right ARROW KEY to open "
+            "the highlighted item's submenu, Enter to confirm (safe for deep submenus). "
+            "action='select' with item=\"Open\": choose an item in a menu that is ALREADY open (context menu or submenu). "
+            "action='close' presses Esc. Names are matched case-insensitively; '&' markers are ignored. "
+            "If a menu closed unexpectedly, reopen it with this tool (not with a mouse click). "
+            "If the window has no enumerable menu (modern/custom UI), the result says so – use press_keys arrows then."
+        ),
+        parameters=_obj({
+            "action": {"type": "string", "enum": ["list", "select", "close"],
+                       "description": "Default: 'select' when path/item is given, otherwise 'list'."},
+            "path": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5,
+                     "description": "Menu-bar path from the top, e.g. [\"File\", \"Export\", \"PDF\"]."},
+            "item": {"type": "string", "description": "Item name in a menu that is ALREADY open (context menu / submenu)."},
+            "window": {"type": "string", "description": "Menu-bar window: title substring or process name (default: active window)."},
+        }), category="keyboard",
     ),
     # --------------------------------------------------------------- programs
     ToolSpec(

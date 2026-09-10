@@ -44,6 +44,22 @@ and installed programs of THIS machine are listed in the "Environment" section b
    if unable to complete or declining the task. Verify the final task outcome before claiming success; for pure
    pointer movement, the successful tool result is sufficient (no extra position check).
    Plain text or {"message":"..."} cannot finish tool work. Continue with tools or use ask_user if you need input.
+9. MENUS (menu bar, submenus, context menus): use the `menu` tool – it works with the KEYBOARD only
+   (Alt+mnemonic, type-ahead, and the arrow keys: Right opens the highlighted item's submenu, Enter confirms,
+   Esc closes) and never moves the mouse, because hovering the pointer over an open menu DISMISSES submenus –
+   that is exactly why clicking into a submenu with the mouse closes it. Call `menu(action="list")` to see the
+   structure, then `menu(action="select", path=["File","Export","PDF"])` for menu-bar paths (submenus included),
+   or `menu(action="select", item="Open")` for a menu that is ALREADY open (right-click context menus).
+   If a menu/submenu closes unexpectedly (a stray mouse move), reopen it with the `menu` tool – do NOT click
+   menu items with the mouse. If the menu cannot be enumerated (modern/custom UI), fall back to `press_keys`
+   arrow keys – still not the mouse – and verify with a screenshot.
+10. NEVER repeat an action that produced no visible change. If the same action gives the same (unchanged) screen
+    twice, do it a third time for nothing: change approach (different target, keyboard/menu route, run_command,
+    open_app, get_window_controls) or, when the sub-step is genuinely impossible, SKIP it and continue with the
+    rest of the task. A greyed-out / disabled control (disabled combo box, greyed button) will never respond to
+    a click: verify with get_window_controls ("enabled") or a zoomed screenshot, then find another route (the
+    `menu` tool, a keyboard shortcut, run_command) or skip the sub-step. Report skipped or impossible sub-steps
+    honestly in the final task_complete summary (success=false if the goal was not reached).
 
 ## Request boundaries and follow-ups
 - The user task labelled [Current user request] is the active request. It stays active during tool-result and
@@ -84,6 +100,26 @@ and installed programs of THIS machine are listed in the "Environment" section b
 - `press_keys` combos use physical keys (ctrl+c works on any layout). If a text field shows the wrong characters,
   select all (ctrl+a), delete, and retype with `type_text`.
 - Before typing, make sure the right window and field have focus (click into it, check the caret on the screenshot).
+- Keyboard layout / input language: the active layout can differ per window. Before ANY task the agent checks
+  the input language (see the "[Input language check ...]" line of the request) and corrects it to the preferred
+  layout before the first action when the setting is enabled; it re-checks before every key press (see
+  Environment: keyboard_layout). Letter-based shortcuts, menu mnemonics and type-ahead depend on the layout;
+  tool results carry a "layout" note when a switch happened or failed. If a layout warning appears, prefer
+  `type_text`/`clipboard`.
+
+## 3D viewports (Blender, 3ds Max, CAD, SketchUp, …)
+- You only ever see ONE camera angle at a time. An object hidden behind another CANNOT be clicked reliably –
+  a click lands on the frontmost object, so NEVER guess the coordinates of an occluded object.
+- Change the viewpoint BEFORE acting when you need to see behind/around objects: orbit the camera with a
+  middle-button drag (`drag` with button="middle"), zoom with the wheel (`scroll`), Blender: numpad 1/3/7 =
+  front/right/top, numpad 5 = perspective, F = frame the selection, A = select all, Alt+A = deselect all.
+  Take a screenshot after EVERY viewpoint change and act only on what you actually see.
+- To work with an object you cannot see, select it WITHOUT the viewport: the Outliner panel (left sidebar;
+  click the name), the F3 command search (Blender: type the object name or "Select"), or the menu path
+  Select ▸ Select by Name (use the `menu` tool). Then verify the selection highlight on a screenshot and
+  operate on the SELECTION (transform, rename, delete) instead of on viewport pixels.
+- When several objects overlap, zoom in on the area, orbit to a clear angle, or filter in the Outliner
+  (Alt+F in Blender) instead of trying to click through the stack.
 
 ## Your own windows
 - The WinAgent application you are running in (the chat window and a small "WinAgent is working" status panel in a
@@ -182,6 +218,14 @@ def environment_section(system_info: dict[str, Any]) -> str:
     if isinstance(layouts, list) and len(layouts) > 1:
         hints.append(f"Multiple keyboard layouts are installed ({', '.join(map(str, layouts))}); the active one can "
                      "change per window – use type_text for non-ASCII text and verify what was typed.")
+    if info.get("keyboard_layout"):
+        if info.get("auto_fix_keyboard_layout"):
+            hints.append(f"Active keyboard layout of the foreground window: {info['keyboard_layout']}. The agent "
+                         f"checks and auto-corrects it to '{info.get('preferred_keyboard_layout', 'en-US')}' before "
+                         "keyboard input; letter shortcuts and menu type-ahead depend on it.")
+        else:
+            hints.append(f"Active keyboard layout of the foreground window: {info['keyboard_layout']} "
+                         "(auto-correction is disabled; letter shortcuts and menu type-ahead depend on it).")
     if info.get("scale_percent") and int(info.get("scale_percent") or 100) != 100:
         hints.append(f"Display scaling is {info['scale_percent']}%; screenshot coordinates are already mapped for you – "
                      "use them as given.")

@@ -188,6 +188,26 @@ class DesktopBackend(ABC):
     @abstractmethod
     def clipboard_set(self, text: str) -> None: ...
 
+    # ------------------------------------------------- keyboard layout / input
+    def active_keyboard_layout(self) -> str:
+        """Name of the input language currently active for the foreground window (e.g. 'en-US')."""
+        return "unknown"
+
+    def set_keyboard_layout(self, name: str) -> str:
+        """Activate keyboard layout ``name`` for the foreground window; return the active layout."""
+        return self.active_keyboard_layout()
+
+    # ------------------------------------------------------------------- menus
+    def menu_structure(self, hwnd: Optional[int] = None) -> Optional[list[dict[str, Any]]]:
+        """Enumerable menu-bar tree of ``hwnd`` (or the active window), or None when the window
+        has no (classic) menu. Nodes: {"text", "mnemonic", "enabled", "items":[...]} /
+        {"separator": True}."""
+        return None
+
+    def open_menu_items(self) -> list[dict[str, Any]]:
+        """Items of the popup menu (context menu / submenu) currently open on screen, or []."""
+        return []
+
     # -------------------------------------------------------------------- misc
     @abstractmethod
     def system_info(self) -> dict[str, Any]: ...

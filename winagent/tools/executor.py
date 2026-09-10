@@ -25,7 +25,8 @@ from ..backends.base import BackendError, DesktopBackend, EmergencyStop, ScreenG
 from ..config import COORDINATE_SPACES, Config
 from ..keys import parse_key_combo
 from ..protocol import ToolCall
-from ..screenshot import Screenshot, prepare_screenshot
+from ..screenshot import (DEDUPE_HAMMING_LIMIT, Screenshot, average_hash, hash_distance, prepare_screenshot,
+                          render_signature, resolve_format)
 from ..screenguard import ScreenGuard, rect_from_points
 from .definitions import TOOLS_BY_NAME
 
@@ -106,6 +107,7 @@ class ToolExecutor:
         self.guard: ScreenGuard = guard or ScreenGuard()
         self.last_screenshot: Optional[Screenshot] = None
         self.screenshot_count = 0
+        self.last_capture_unchanged = False   # set by take_screenshot(): the capture was a duplicate
         self._bound_frame = _CURRENT_FRAME
         self._bound_coordinate_space: Optional[str] = None
         self._coordinate_mappings: list[dict[str, Any]] = []
@@ -186,6 +188,28 @@ class ToolExecutor:
                 f"Unstable or inconsistent screen capture: before={before}, after={after}, "
                 f"expected pixels={expected_size}, captured pixels={raw.size}. "
                 "Take a new full screenshot after the display settles; do not guess a scale or offset.")
+        effective_grid = cfg.screenshot_grid if grid is None else bool(grid)
+        max_width = None if cfg.screenshot_native_resolution else cfg.screenshot_max_width
+        # 'auto' picks lossless PNG for flat UI screens and JPEG for photo/3D content; the CONCRETE
+        # format feeds both the duplicate signature and the encoder so a deduped frame matches exactly.
+        fmt = resolve_format(raw, cfg.screenshot_format)
+        # Duplicate suppression: if the desktop is perceptually unchanged (same scope/bounds AND same
+        # rendering settings), reuse the previous frame so the agent does not re-send an identical image.
+        prev = self.last_screenshot
+        if (phys_region is None and self.config.dedupe_screenshots and prev is not None
+                and prev.desktop_bounds == before and prev.all_screens == capture_all and prev.phash):
+            sig = render_signature(raw.size, max_width=max_width, fmt=fmt,
+                                   quality=cfg.screenshot_jpeg_quality, subsampling=cfg.screenshot_jpeg_subsampling,
+                                   grid=effective_grid, grid_spacing=cfg.screenshot_grid_spacing,
+                                   cursor=cfg.screenshot_show_cursor, coordinate_space=cfg.coordinate_space)
+            distance = hash_distance(prev.phash, average_hash(raw))
+            if prev.render_sig == sig and distance <= DEDUPE_HAMMING_LIMIT:
+                self.last_capture_unchanged = True
+                self.screenshot_count += 1  # a capture was still taken; only the re-send is skipped
+                log.info("Screenshot identical to frame %s (hash distance %d) – reusing previous frame.",
+                         prev.frame_id, distance)
+                return prev
+        self.last_capture_unchanged = False
         cursor = None
         if cfg.screenshot_show_cursor:
             try:
@@ -194,12 +218,12 @@ class ToolExecutor:
                 cursor = None
         if phys_region:
             geometry = ScreenGeometry(phys_region[0], phys_region[1], phys_region[2] - phys_region[0], phys_region[3] - phys_region[1])
-        max_width = None if cfg.screenshot_native_resolution else cfg.screenshot_max_width
         shot = prepare_screenshot(
             raw, geometry=geometry, max_width=max_width,
-            grid=cfg.screenshot_grid if grid is None else bool(grid),
+            grid=effective_grid,
             grid_spacing=cfg.screenshot_grid_spacing, cursor=cursor,
-            fmt=cfg.screenshot_format, quality=cfg.screenshot_jpeg_quality, coordinate_space=cfg.coordinate_space,
+            fmt=fmt, quality=cfg.screenshot_jpeg_quality,
+            subsampling=cfg.screenshot_jpeg_subsampling, coordinate_space=cfg.coordinate_space,
         )
         shot.is_region = phys_region is not None
         shot.all_screens = capture_all
@@ -252,6 +276,41 @@ class ToolExecutor:
         if self.guard.ui_has_focus():
             return self.guard.shield()
         return contextlib.nullcontext()
+
+    def _ensure_keyboard_layout(self) -> Optional[str]:
+        """Check the active input language and correct it when needed.
+
+        Always called before any keyboard input (and once at the start of every task), so the
+        machine is in the preferred language state BEFORE anything happens. The mismatch is
+        reported to the model even when auto-correction is disabled; the switch itself only
+        happens when the setting is on. Returns a note (None when the layout is already correct).
+        Letter shortcuts, menu mnemonics and type-ahead depend on the layout; type_text does not (Unicode).
+        """
+        cfg = self.config
+        preferred = (cfg.preferred_keyboard_layout or "").strip()
+        if not preferred or preferred.lower() in ("any", "auto", "off"):
+            return None
+        try:
+            active = self.backend.active_keyboard_layout()
+        except Exception as exc:  # pragma: no cover - backend without layout support
+            log.debug("active_keyboard_layout unavailable: %s", exc)
+            return None
+        if not active or active == "unknown" or active.lower() == preferred.lower():
+            return None
+        if not cfg.auto_fix_keyboard_layout:
+            return (f"Keyboard layout is '{active}' but the preferred layout is '{preferred}' and auto-correction "
+                    "is disabled. Letter shortcuts and menu type-ahead may produce unexpected characters; "
+                    "prefer type_text/clipboard for text and press only physical-key shortcuts.")
+        try:
+            now = self.backend.set_keyboard_layout(preferred)
+        except Exception as exc:
+            return (f"Keyboard layout is '{active}' but switching to the preferred '{preferred}' failed ({exc}). "
+                    "Letter keys and menu shortcuts may produce unexpected characters; prefer type_text/clipboard for text.")
+        if now and now.lower() == preferred.lower():
+            return f"Keyboard layout was '{active}'; switched to '{now}'."
+        return (f"Keyboard layout is '{active}' and the preferred '{preferred}' could not be activated "
+                f"(now: {now or 'unknown'}); letter keys may produce unexpected characters "
+                "(prefer type_text/clipboard for text).")
 
     def _check_stop(self) -> None:
         if self.stop_event is not None and self.stop_event.is_set():
@@ -351,6 +410,20 @@ class ToolExecutor:
                         time.sleep(max(0.0, self.config.action_delay))
                         frame = self.input_screenshot
                         result.screenshot = self.take_screenshot(all_screens=frame.all_screens if frame else False)
+                        if self.last_capture_unchanged and frame is not None:
+                            result.data["screen_unchanged"] = True
+                            if spec.category == "keyboard":
+                                # Keyboard input often changes only a few pixels (typed characters) that can fall
+                                # below the duplicate-detection threshold, so "unchanged" is NOT proof of failure.
+                                result.data["note"] = (f"The screen looks unchanged (identical to full frame {frame.frame_id} "
+                                                       "within tolerance); no new image is attached. Small changes (a few "
+                                                       "typed characters, a caret) can fall below this detection threshold – "
+                                                       "verify the exact state (zoomed region screenshot or get_window_controls) "
+                                                       "before repeating the input.")
+                            else:
+                                result.data["note"] = (f"The screen is unchanged (identical to full frame {frame.frame_id} "
+                                                       "within tolerance); no new image is attached. The action had no "
+                                                       "visible effect – do not repeat it, change approach or skip the step.")
                     except CoordinateFrameChanged as exc:
                         # The action already succeeded. Keep ok=True; don't invite its replay just because capture failed.
                         result.data["screenshot_error"] = str(exc)
@@ -384,6 +457,11 @@ class ToolExecutor:
             region = [self._model_coord_int(v, "region") for v in region]
         shot = self.take_screenshot(region=region, all_screens=bool(a.get("all_screens", False)), grid=a.get("grid"))
         data: dict[str, Any] = {"message": "Screenshot captured."}
+        if self.last_capture_unchanged:
+            data["screen_unchanged"] = True
+            data["note"] = (f"The screen is unchanged since full frame {shot.frame_id} (already in the context); "
+                            "the identical image was not re-sent. Treat this as strong evidence that nothing changed "
+                            "(only tiny changes can fall below the detection threshold).")
         frame = self.input_screenshot if shot.is_region else shot
         try:
             win = self.backend.active_window()
@@ -498,6 +576,7 @@ class ToolExecutor:
         text = str(text)
         interval = float(a.get("interval") or 0.0)
         note = self._start_search_note()
+        layout_note = self._ensure_keyboard_layout()
         with self._keyboard_guard():
             self.backend.type_text(text, interval=min(max(interval, 0.0), 0.5))
             if a.get("press_enter"):
@@ -506,6 +585,8 @@ class ToolExecutor:
         data: dict[str, Any] = {"message": f"Typed {len(text)} characters" + (" and pressed Enter." if a.get("press_enter") else ".")}
         if note:
             data["note"] = note
+        if layout_note:
+            data["layout"] = layout_note
         return ToolResult(call, True, data)
 
     def _t_press_keys(self, call: ToolCall, a: dict[str, Any]) -> ToolResult:
@@ -514,6 +595,7 @@ class ToolExecutor:
             raise ValueError("'keys' is required")
         combo = parse_key_combo(keys)
         repeat = min(max(_to_int(a.get("repeat", 1), "repeat"), 1), 50)
+        layout_note = self._ensure_keyboard_layout()
         with self._keyboard_guard():
             self.backend.press_keys(combo, repeat=repeat)
         data: dict[str, Any] = {"message": f"Pressed {'+'.join(combo)}" + (f" x{repeat}" if repeat > 1 else "") + "."}
@@ -521,6 +603,8 @@ class ToolExecutor:
             data["note"] = ("Start menu / Run / Search opened. If your goal is to launch a program, use `open_app` instead – "
                             "it is far more reliable. If you continue here, read the highlighted result on a screenshot "
                             "before pressing Enter and verify the resulting window title.")
+        if layout_note:
+            data["layout"] = layout_note
         return ToolResult(call, True, data)
 
     def _t_hotkey_sequence(self, call: ToolCall, a: dict[str, Any]) -> ToolResult:
@@ -528,6 +612,7 @@ class ToolExecutor:
         if isinstance(seq, str):
             seq = [s.strip() for s in re.split(r"[,;]|\bthen\b", seq) if s.strip()]
         delay = min(max(float(a.get("delay") or 0.3), 0.0), 5.0)
+        layout_note = self._ensure_keyboard_layout()
         done = []
         with self._keyboard_guard():
             for item in seq:
@@ -536,7 +621,215 @@ class ToolExecutor:
                 self.backend.press_keys(combo)
                 done.append("+".join(combo))
                 time.sleep(delay)
-        return ToolResult(call, True, {"message": f"Pressed sequence: {', '.join(done)}."})
+        data: dict[str, Any] = {"message": f"Pressed sequence: {', '.join(done)}."}
+        if layout_note:
+            data["layout"] = layout_note
+        return ToolResult(call, True, data)
+
+    # ------------------------------------------------------------------ menus
+    @staticmethod
+    def _menu_name(item: dict[str, Any]) -> str:
+        return re.sub(r"&", "", str(item.get("text") or "")).strip().lower()
+
+    def _menu_find(self, items: list[dict[str, Any]], name: str) -> Optional[dict[str, Any]]:
+        """Case/''-insensitive exact match first, then unique prefix, then unique substring."""
+        want = re.sub(r"&", "", str(name or "")).strip().lower()
+        if not want:
+            return None
+        cands = [i for i in items if not i.get("separator") and self._menu_name(i)]
+        for i in cands:
+            if self._menu_name(i) == want:
+                return i
+        prefix = [i for i in cands if self._menu_name(i).startswith(want)]
+        if len(prefix) == 1:
+            return prefix[0]
+        sub = [i for i in cands if want in self._menu_name(i)]
+        if len(sub) == 1:
+            return sub[0]
+        return None
+
+    @staticmethod
+    def _typeahead_prefix(target: str, labels: list[str]) -> str:
+        """Shortest prefix of ``target`` that uniquely identifies it among ``labels``."""
+        want = re.sub(r"&", "", str(target or "")).strip().lower()
+        pool = [l for l in labels if l]
+        for i in range(1, len(want) + 1):
+            p = want[:i]
+            if sum(1 for l in pool if l.startswith(p)) == 1:
+                return str(target).strip()[:i]
+        return str(target).strip()
+
+    def _menu_typeahead(self, prefix: str) -> None:
+        """Type characters one-by-one (Unicode) so any layout/menu language works."""
+        for ch in prefix:
+            self._check_stop()
+            self.backend.type_text(ch)
+            time.sleep(0.12)
+
+    def _wait_popup(self, timeout: float = 1.0) -> list[dict[str, Any]]:
+        """Poll until a popup menu (menu-bar dropdown / submenu) is open; return its items.
+
+        Returns [] when the timeout passes with no popup – the caller then falls back to the
+        pre-enumerated menu tree (the same structure the model saw with action='list').
+        """
+        deadline = time.time() + max(0.1, timeout)
+        while True:
+            self._check_stop()
+            try:
+                items = self.backend.open_menu_items()
+            except Exception:
+                items = []
+            if items:
+                return items
+            if time.time() >= deadline:
+                return []
+            time.sleep(0.05)
+
+    @staticmethod
+    def _menu_labels(items: list[dict[str, Any]]) -> list[str]:
+        return [ToolExecutor._menu_name(i) for i in items if not i.get("separator") and i.get("text")]
+
+    def _t_menu(self, call: ToolCall, a: dict[str, Any]) -> ToolResult:
+        action = str(a.get("action") or ("select" if (a.get("path") or a.get("item")) else "list")).strip().lower()
+        layout_note = self._ensure_keyboard_layout()
+        if action == "close":
+            with self._keyboard_guard():
+                self.backend.press_keys(["esc"])
+            data = {"message": "Menu closed (Esc)."}
+            if layout_note:
+                data["layout"] = layout_note
+            return ToolResult(call, True, data)
+        if action == "list":
+            data: dict[str, Any] = {}
+            popup = self.backend.open_menu_items()
+            if popup:
+                data["open_popup"] = popup
+            win = None
+            if a.get("window") or a.get("title") or a.get("hwnd"):
+                win = self._find_window(a)
+            else:
+                try:
+                    win = self.backend.active_window()
+                except Exception:
+                    win = None
+            bar = self.backend.menu_structure(win.hwnd if win else None)
+            if bar:
+                data["menu_bar"] = bar
+                if win:
+                    data["menu_bar_window"] = self._window_dict(win)
+            if not bar and not popup:
+                data["note"] = ("No enumerable menu found for this window (modern/custom UI or no menu bar). "
+                                "If a context menu is open, use action='select' with item=...; otherwise navigate with "
+                                "press_keys (F10 then arrow keys) and a screenshot, or use the app's search command "
+                                "(e.g. F3 in Blender).")
+            return ToolResult(call, True, data)
+        if action == "select":
+            return self._menu_select(call, a, layout_note)
+        raise ValueError("action must be 'list', 'select' or 'close'")
+
+    def _menu_select(self, call: ToolCall, a: dict[str, Any], layout_note: Optional[str]) -> ToolResult:
+        """Select a menu item using ONLY the keyboard.
+
+        Keyboard sequence (never the mouse – hovering the pointer over an open menu dismisses it):
+        open the top item with Alt+mnemonic (or F10 + type-ahead + Enter), then for each deeper
+        level type the unique prefix of the matched item (type-ahead highlights it), press Right
+        (arrow key) to open its submenu, or Enter to confirm the last item.
+        """
+        path_ = [str(p).strip() for p in (a.get("path") or []) if str(p).strip()]
+        item_name = str(a.get("item") or "").strip()
+        if not path_ and not item_name:
+            raise ValueError("action='select' needs 'path' (menu bar) or 'item' (already-open popup).")
+        steps: list[str] = []
+        notes: list[str] = []
+
+        if item_name and not path_:
+            popup = self.backend.open_menu_items()
+            if not popup:
+                raise BackendError("No open menu/popup was detected. Right-click first, or use path=[...] to "
+                                   "navigate from the menu bar.")
+            target = self._menu_find(popup, item_name)
+            if target is None:
+                raise BackendError(f"Item {item_name!r} not found in the open menu. "
+                                   f"Available: {self._menu_labels(popup)}")
+            # Type the unique prefix of the MATCHED item's own name -> deterministic highlight.
+            prefix = self._typeahead_prefix(str(target.get("text") or ""), self._menu_labels(popup))
+            with self._keyboard_guard():
+                self._menu_typeahead(prefix)
+                time.sleep(0.1)
+                self.backend.press_keys(["enter"])
+            steps.append(f"type-ahead '{prefix}' + Enter")
+            return ToolResult(call, True, {
+                "message": f"Selected '{target.get('text')}' from the open menu (keyboard only).",
+                "steps": steps, "layout": layout_note,
+            })
+
+        # menu-bar navigation: open the first item, then walk the rest with type-ahead + arrow keys
+        win = None
+        if a.get("window") or a.get("title") or a.get("hwnd"):
+            win = self._find_window(a)
+        else:
+            try:
+                win = self.backend.active_window()
+            except Exception:
+                win = None
+        if win is None:
+            raise BackendError("No active window to open a menu in.")
+        structure = self.backend.menu_structure(win.hwnd)
+        if not structure:
+            raise BackendError("This window has no enumerable menu bar. If a popup is already open use item=...; "
+                               "otherwise navigate with press_keys (F10, arrows) instead.")
+        if not self.backend.focus_window(win.hwnd):
+            notes.append(f"Could not bring '{win.title}' to the front; the menu may open in another window.")
+        target = self._menu_find(structure, path_[0])
+        if target is None:
+            raise BackendError(f"Menu-bar item {path_[0]!r} not found. Available: {self._menu_labels(structure)}")
+        if len(path_) > 1 and not target.get("items"):
+            raise BackendError(f"Menu-bar item '{target.get('text')}' has no submenu, so the path "
+                               f"'{' > '.join(path_)}' cannot continue. Available at level 1: {self._menu_labels(structure)}.")
+        with self._keyboard_guard():
+            if target.get("mnemonic"):
+                self.backend.press_keys(["alt", target["mnemonic"]])
+                steps.append(f"alt+{target['mnemonic']}")
+            else:
+                self.backend.press_keys(["f10"])
+                steps.append("f10")
+                prefix0 = self._typeahead_prefix(str(target.get("text") or ""), self._menu_labels(structure))
+                self._menu_typeahead(prefix0)
+                steps.append(f"type-ahead '{prefix0}'")
+                self.backend.press_keys(["enter"])
+                steps.append("enter")
+            # wait until the top menu's popup is actually open, then walk the rest of the path
+            current = self._wait_popup(timeout=1.0) or (target.get("items") or [])
+            for depth in range(1, len(path_)):
+                self._check_stop()
+                labels = self._menu_labels(current)
+                target = self._menu_find(current, path_[depth])
+                if target is None:
+                    raise BackendError(f"Item {path_[depth]!r} not found in the open menu at level {depth}. "
+                                       f"Available: {labels}")
+                # deterministic highlight: type the unique prefix of the matched item's own name
+                prefix = self._typeahead_prefix(str(target.get("text") or ""), labels)
+                self._menu_typeahead(prefix)
+                steps.append(f"type-ahead '{prefix}'")
+                if depth < len(path_) - 1:
+                    if not target.get("items"):
+                        raise BackendError(f"Item {path_[depth]!r} has no submenu, so the path cannot continue "
+                                           f"to level {depth + 1}. Available at this level: {labels}.")
+                    # ARROW KEY: open the highlighted item's submenu (never the mouse – hovering an
+                    # open menu dismisses it). Wait until the submenu popup is actually open.
+                    self.backend.press_keys(["right"])
+                    steps.append("right (open submenu)")
+                    time.sleep(0.15)
+                    current = self._wait_popup(timeout=0.8) or (target.get("items") or [])
+                else:
+                    self.backend.press_keys(["enter"])
+                    steps.append("enter")
+        return ToolResult(call, True, {
+            "message": f"Selected menu path {' > '.join(path_)} (keyboard only: type-ahead + arrow keys, no mouse).",
+            "window": self._window_dict(win), "steps": steps,
+            **({"layout": layout_note} if layout_note else {}),
+            **({"note": " ".join(notes)} if notes else {}),
+        })
 
     # -------------------------------------------------------------- programs
     def _t_open_app(self, call: ToolCall, a: dict[str, Any]) -> ToolResult:
@@ -750,6 +1043,7 @@ _ALIASES = {
     "type": "type_text", "keyboard_type": "type_text", "write": "type_text", "input_text": "type_text", "typewrite": "type_text",
     "press": "press_keys", "hotkey": "press_keys", "key": "press_keys", "keypress": "press_keys", "press_key": "press_keys",
     "send_keys": "press_keys", "key_press": "press_keys", "shortcut": "press_keys",
+    "menu_navigate": "menu", "navigate_menu": "menu", "select_menu_item": "menu", "open_menu": "menu", "menu_item": "menu",
     "open_application": "open_app", "launch_app": "open_app", "launch": "open_app", "start_app": "open_app", "open_program": "open_app",
     "open": "open_app", "run_app": "open_app", "open_file": "open_app",
     "browse": "open_url", "open_browser": "open_url", "navigate": "open_url",

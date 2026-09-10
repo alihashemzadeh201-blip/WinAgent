@@ -23,6 +23,8 @@
   "mouse_failsafe": true,
   "response_language": "auto",
   "extra_system_prompt": "",
+  "preferred_keyboard_layout": "en-US",
+  "auto_fix_keyboard_layout": true,
 
   "coordinate_space": "image_pixels",
   "screenshot_max_width": 1280,
@@ -30,8 +32,10 @@
   "screenshot_grid": true,
   "screenshot_grid_spacing": 100,
   "screenshot_show_cursor": true,
-  "screenshot_format": "jpeg",
+  "screenshot_format": "auto",
   "screenshot_jpeg_quality": 70,
+  "dedupe_screenshots": true,
+  "screenshot_jpeg_subsampling": 0,
 
   "backend": "auto",
   "gui_mode_while_running": "overlay",
