@@ -103,3 +103,12 @@ def test_agent_picks_up_new_skill_without_rebuild(config, backend, tmp_path, mon
     skills_mod.save_skill("fresh", "### Steps\nDo the thing.\n", tmp_path)
     # the very next request sees the installed skill – no agent rebuild needed
     assert "### Skill: fresh" in agent._system_message()["content"]
+
+
+def test_shipped_3d_skill_loads_from_project_dir():
+    from winagent.skills import MAX_SKILL_CHARS, _project_skills_dir
+    skills = load_skills()
+    s3d = next((s for s in skills if s.name == "3d-software"), None)
+    assert s3d is not None, "the bundled 3D skill must ship in the project skills dir"
+    assert s3d.truncated is False and len(s3d.body) <= MAX_SKILL_CHARS
+    assert "OUTLINER" in s3d.body.upper() and "num1" in s3d.body
