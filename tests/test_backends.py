@@ -88,3 +88,60 @@ def test_cli_backend_flag_precedence(monkeypatch, args, configured, expected):
 
     assert entrypoint.main(["--cli", *args]) == 0
     loop.assert_called_once_with(cfg, expected, None)
+
+
+# ---------------------------------------------------------------- ctypes hygiene
+
+def test_windows_backend_never_passes_byref_to_pointer_argtypes():
+    """Regression: Python 3.12 rejects ctypes.byref() for POINTER-declared argtypes.
+
+    It raised ``ArgumentError: expected LP__RECT instance instead of pointer to RECT`` in
+    production (crashing ``window_action``), and it silently zeroed the mouse/active-window
+    screenshot data through a swallowed exception in ``mouse_position``.  Every call to a
+    function whose argtypes declare POINTER(...) must pass the ctypes instance (or an array),
+    never byref(); functions declared with c_void_p may keep byref.
+    """
+    import ast
+    import re
+    from pathlib import Path
+
+    source = (Path(windows.__file__).with_suffix(".py")).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    # 1) collect the functions declared with a POINTER(...) argtype
+    pointer_funcs: set[str] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Attribute)):
+            continue
+        target = node.targets[0]
+        if not (isinstance(target.value, ast.Attribute) and target.attr == "argtypes"):
+            continue
+        func_name = target.value.attr
+        if not isinstance(node.value, (ast.List, ast.Tuple)):
+            continue
+        for item in node.value.elts:
+            if not isinstance(item, ast.Call):
+                continue
+            ptr_name = (item.func.id if isinstance(item.func, ast.Name)
+                        else item.func.attr if isinstance(item.func, ast.Attribute) else None)
+            if ptr_name == "POINTER":
+                pointer_funcs.add(func_name)
+    assert {"GetWindowRect", "GetPhysicalCursorPos"} <= pointer_funcs  # sanity: the audit found these
+
+    # 2) no call site of those functions may pass a byref(...) argument
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else (
+            func.id if isinstance(func, ast.Name) else None)
+        if name not in pointer_funcs:
+            continue
+        for arg in node.args:
+            if (isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name)
+                    and arg.func.id in ("byref", "pointer")):
+                line = re.sub(r"\s+", " ", source.splitlines()[node.lineno - 1].strip())
+                offenders.append(f"line {node.lineno}: {name}({arg.func.id}(...)): {line}")
+    assert not offenders, "byref/pointer passed to a POINTER-argtypes function:\n" + "\n".join(offenders)

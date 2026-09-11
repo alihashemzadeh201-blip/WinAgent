@@ -271,6 +271,58 @@ class Agent:
     def _messages(self, coordinate_space: Optional[str] = None) -> list[dict[str, Any]]:
         return [self._system_message(coordinate_space), *self.history]
 
+    def _sanitize_request(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Enforce a provider-safe request shape immediately before an HTTP request is sent.
+
+        Newer Gemini models (and gateways such as Antigravity in front of them) reject requests
+        whose final turn is a model turn ("Requests ending with a model turn are not supported"),
+        and every assistant tool_call must be answered by a matching tool result.  History
+        bookkeeping normally keeps these invariants, but external mutations of Agent.history
+        (e.g. a GUI rebuild between requests) or a future code path could break them.  This is
+        the last line of defence: it repairs the request in place of crashing the task, and it
+        logs exactly what it repaired so the underlying cause shows up in the app log.
+        """
+        repaired: list[str] = []
+        out: list[dict[str, Any]] = []
+        pending: list[tuple[str, str]] = []   # (tool_call_id, name) of unanswered assistant calls
+
+        def flush() -> None:
+            for call_id, name in pending:
+                out.append({"role": "tool", "tool_call_id": call_id, "name": name,
+                            "content": ("[Result was lost before this request went out; the action may or may not "
+                                        "have been executed. Check the current screen before repeating it.]")})
+            pending.clear()
+
+        for msg in messages:
+            role = msg.get("role")
+            if role == "assistant":
+                flush()
+                out.append(msg)
+                for tc in msg.get("tool_calls") or []:
+                    if isinstance(tc, dict) and tc.get("id"):
+                        fn = tc.get("function") or {}
+                        pending.append((str(tc["id"]), str(tc.get("name") or fn.get("name") or "tool")))
+            elif role == "tool":
+                call_id = msg.get("tool_call_id")
+                if call_id in [p[0] for p in pending]:
+                    pending = [p for p in pending if p[0] != call_id]
+                    out.append(msg)
+                else:
+                    repaired.append(f"dropped orphan tool message (id={call_id!r})")
+            else:
+                flush()
+                out.append(msg)
+        flush()
+        if out and out[-1].get("role") == "assistant":
+            out.append({"role": "user",
+                        "content": "[The previous turn ended without a reply. Continue the task from where it stopped.]"})
+            repaired.append("appended trailing user nudge after an unterminated model turn")
+        if repaired:
+            roles = [str(m.get("role")) for m in messages][-8:]
+            log.warning("Request shape repaired before send: %s (request tail roles: %s)",
+                        "; ".join(repaired), " -> ".join(roles))
+        return out
+
     def _append(self, msg: dict[str, Any], has_image: bool = False) -> None:
         self.history.append(msg)
         if has_image:
@@ -625,6 +677,8 @@ class Agent:
             self._stall_warned = True
             names = ", ".join(dict.fromkeys(c.name for c in calls))
             count = max(self._stall_count, self._stall_tool_count)
+            log.warning("Stall warning injected: %s attempted %d times in a row with no visible change; "
+                        "asked the model to change approach or skip the step.", names, count)
             self.history.append({"role": "user", "content": (
                 f"[Stall detected: {names} has now been attempted {count} times in a row with NO visible "
                 "change on the screen (or failing every time). Repeating it will not work – do NOT call "
@@ -678,6 +732,7 @@ class Agent:
         seq = self._trace_seq
         retries = 0
         repair_reason = ""
+        truncation_boosted = False  # True after a truncated response: the next attempt gets 2x the token budget
         last_content = ""          # raw text of the most recently rejected response
         last_turn: Optional[AssistantTurn] = None  # its parsed form, when parsing itself succeeded
         while True:
@@ -695,11 +750,18 @@ class Agent:
             # asked again verbatim. Each retry therefore also raises the temperature slightly so the
             # loop can escape the identical-output attractor (capped at 1.5).
             retry_temperature = None if retries == 0 else min(self.config.temperature + 0.25 * retries, 1.5)
+            # Thinking models burn most of the output budget on hidden reasoning, so the FIRST truncation
+            # gets one retry with a doubled max_tokens (capped) before we start asking for brevity.
+            retry_max_tokens = None
+            if truncation_boosted and self.config.max_tokens > 0:
+                retry_max_tokens = min(self.config.max_tokens * 2, 32768)
             try:
                 tools = openai_tool_schemas(coordinate_space) if self.protocol == "native" else None
+                messages = self._sanitize_request(messages)
                 self._record_request(seq, retries, retry_temperature, messages, tools, response_json=False)
                 try:
-                    resp = self.llm.chat(messages, tools=tools, temperature=retry_temperature)
+                    resp = self.llm.chat(messages, tools=tools, temperature=retry_temperature,
+                                         max_tokens=retry_max_tokens)
                 except LLMError as exc:
                     self._record_response(seq, retries, None, ok=False,
                                            error=f"{type(exc).__name__}: {exc}",
@@ -718,6 +780,10 @@ class Agent:
                 if isinstance(resp.message.get("refusal"), str) and resp.message["refusal"].strip():
                     return parse_native_response(resp.message)  # a genuine refusal is not a format fault
                 if resp.finish_reason in ("length", "max_tokens", "max_output_tokens"):
+                    if not truncation_boosted and self.config.max_tokens > 0:
+                        truncation_boosted = True
+                        log.info("Response truncated at max_tokens=%d; the retry will use %d.",
+                                 self.config.max_tokens, min(self.config.max_tokens * 2, 32768))
                     raise LLMResponseError("The response was truncated by the output-token limit. Reply more concisely.")
                 if self.protocol == "native" or resp.message.get("tool_calls") or resp.message.get("function_call") is not None:
                     turn = parse_native_response(resp.message, allow_plain_text=False)

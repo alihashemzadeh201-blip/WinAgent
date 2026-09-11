@@ -339,3 +339,115 @@ def test_repair_prompt_escalates_and_temperature_rises(config, backend, protocol
         assert '"actions":[{"tool":"screenshot"' in r3
     else:
         assert "Use ONLY tool_calls" not in r2 and "Use ONLY tool_calls" in r3
+
+
+# ------------------------------------------------------------------ request shape
+
+def test_sanitize_request_repairs_model_turn_tails(config, backend):
+    agent = make_agent(config, backend, ScriptedLLM([]))
+    base = [{"role": "system", "content": "s"}]
+
+    # 1) trailing assistant turn with an UNANSWERED tool call gets a synthetic result
+    msgs = base + [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "click", "arguments": "{}"}},
+            {"id": "c2", "type": "function", "function": {"name": "type_text", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "name": "click", "content": "ok"},
+    ]
+    out = agent._sanitize_request(msgs)
+    assert out[-1]["role"] == "tool"
+    synth = [m for m in out if m["role"] == "tool" and m.get("tool_call_id") == "c2"]
+    assert len(synth) == 1 and "Result was lost" in synth[0]["content"] and synth[0]["name"] == "type_text"
+    # the input is not mutated in place
+    assert not any(m.get("tool_call_id") == "c2" for m in msgs)
+
+    # 2) trailing plain assistant turn (no tool calls) gets a trailing user nudge
+    out2 = agent._sanitize_request(base + [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "thinking out loud…"},
+    ])
+    assert out2[-1]["role"] == "user" and "Continue the task" in out2[-1]["content"]
+
+    # 3) an orphan tool message (no matching assistant call) is dropped
+    out3 = agent._sanitize_request(base + [
+        {"role": "tool", "tool_call_id": "ghost", "name": "click", "content": "boom"},
+        {"role": "user", "content": "hi"},
+    ])
+    assert not any(m.get("role") == "tool" for m in out3)
+
+    # 4) a well-formed request passes through unchanged
+    good = base + [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "click", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "name": "click", "content": "ok"},
+    ]
+    assert agent._sanitize_request(good) == good
+
+
+def test_run_repairs_history_left_ending_on_assistant(config, backend):
+    """A GUI rebuild between requests can hand the next run a live history captured mid-round."""
+    llm = ScriptedLLM([native_tool_message(("task_complete", {"summary": "done."}))])
+    agent = make_agent(config, backend, llm)
+    agent.history.append({"role": "assistant", "content": "", "tool_calls": [
+        {"id": "stale_1", "type": "function", "function": {"name": "click", "arguments": "{}"}}]})
+    outcome = agent.run("click the button", initial_screenshot=False)
+    assert outcome.status == "completed"
+    first = llm.calls[0]["messages"]
+    # the stale tool call was answered (synthetically) before the current user request, and the
+    # request still ends with a user turn – never a model turn
+    assert any(m.get("role") == "tool" and m.get("tool_call_id") == "stale_1" for m in first)
+    assert first[-1]["role"] == "user"
+    roles = [m["role"] for m in first]
+    assert roles.count("assistant") == 1
+
+
+# ------------------------------------------------------- truncation token budget
+
+def test_truncation_retries_with_doubled_max_tokens(config, backend):
+    from winagent.llm import ChatResponse
+    truncated = ChatResponse(
+        message={"role": "assistant", "content": "I will start by…"},
+        finish_reason="max_tokens", usage={}, model="fake-model", raw={}, latency=0.01)
+    llm = ScriptedLLM([truncated, native_tool_message(("task_complete", {"summary": "done."}))])
+    agent = make_agent(config, backend, llm)
+    outcome = agent.run("do something", initial_screenshot=False)
+    assert outcome.status == "completed"
+    assert llm.calls[0]["max_tokens"] is None
+    assert llm.calls[1]["max_tokens"] == 2 * config.max_tokens
+
+
+def test_truncation_boost_is_capped(config, backend):
+    from winagent.llm import ChatResponse
+    config.max_tokens = 40000
+    truncated = ChatResponse(
+        message={"role": "assistant", "content": "I will start by…"},
+        finish_reason="max_tokens", usage={}, model="fake-model", raw={}, latency=0.01)
+    llm = ScriptedLLM([truncated, native_tool_message(("task_complete", {"summary": "done."}))])
+    agent = make_agent(config, backend, llm)
+    agent.run("do something", initial_screenshot=False)
+    assert llm.calls[1]["max_tokens"] == 32768
+
+
+# ------------------------------------------------------------------- vision loss
+
+def test_vision_downgrade_after_image_rejection(config, backend):
+    """Ollama answers image input with a 500 'no mmproj'; the agent must continue text-only."""
+    def reject(_messages):
+        llm.supports_vision = False
+        raise LLMError("Model does not accept images: image input is not supported (mmproj missing)")
+
+    llm = ScriptedLLM([
+        reject,
+        native_tool_message(("task_complete", {"summary": "done text-only."})),
+    ])
+    agent = make_agent(config, backend, llm)
+    outcome = agent.run("open notepad", initial_screenshot=True)
+    assert outcome.status == "completed"
+    assert agent.vision is False
+    # the retry must not carry any image parts
+    assert not any(isinstance(m.get("content"), list)
+                   and any(p.get("type") == "image_url" for p in m["content"])
+                   for m in llm.calls[1]["messages"])

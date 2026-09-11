@@ -89,7 +89,10 @@ def physical_backend(monkeypatch):
     pointer = [300, 200]
 
     def get_physical(point):
-        point._obj.x, point._obj.y = pointer
+        # the backend passes the POINT instance (ctypes takes its address for the POINTER argtype);
+        # tolerate a byref wrapper too so a regression back to byref() still updates the mock state
+        obj = point._obj if hasattr(point, "_obj") else point
+        obj.x, obj.y = pointer
         return True
 
     def set_physical(x, y):

@@ -48,7 +48,7 @@ class ScriptedLLM:
         from winagent.llm import ChatResponse, LLMError
 
         self.calls.append({"messages": json.loads(json.dumps(messages)), "tools": tools,
-                           "temperature": temperature})
+                           "temperature": temperature, "max_tokens": max_tokens})
         if not self.responses:
             raise LLMError("script exhausted")
         item = self.responses.pop(0)

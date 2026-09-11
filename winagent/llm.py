@@ -133,9 +133,14 @@ class LLMClient:
 
             body = resp.text[:2000]
             err_msg = _extract_error(body) or body
+            lowered = err_msg.lower()
+            # Context overflow is deterministic for this request: retrying the same bytes cannot
+            # succeed, so fail fast with an actionable message instead of burning the retry budget.
+            if _is_context_overflow(lowered):
+                log.info("Provider reported a context overflow (HTTP %s); failing fast.", resp.status_code)
+                raise LLMError(_context_overflow_message(err_msg), resp.status_code, body)
             # Feature negotiation: drop unsupported parameters and retry immediately.
             if resp.status_code in (400, 404, 422):
-                lowered = err_msg.lower()
                 if "tools" in payload and any(k in lowered for k in ("tool", "function")):
                     log.info("Server rejected tools (%s); falling back to JSON protocol.", err_msg[:120])
                     self.supports_tools = False
@@ -160,6 +165,21 @@ class LLMClient:
             if resp.status_code == 404:
                 raise LLMError(f"Endpoint or model not found (404) at {url}: {err_msg}", resp.status_code, body)
             if resp.status_code in (408, 409, 425, 429, 500, 502, 503, 504):
+                # A model without image support is deterministic (e.g. Ollama's 500 "image input is not
+                # supported - could not find mmproj..."): flag it so the agent can continue vision-free
+                # instead of dying after four wasted retries.
+                if _image_unsupported(lowered):
+                    self.supports_vision = False
+                    raise LLMError(f"Model does not accept images: {err_msg}", resp.status_code, body)
+                # Gateways such as Antigravity wrap deterministic 400-class rejections in a 503
+                # (INVALID_ARGUMENT, FAILED_PRECONDITION, ...). Retrying the identical bytes cannot
+                # possibly succeed, so fail fast with the provider's reason. The gRPC-style code is
+                # often in a separate JSON field ("status"), so scan the raw body, not just err_msg.
+                reason = _non_transient_reason(body.lower())
+                if reason:
+                    log.info("LLM %s is a deterministic provider rejection (%s); failing fast without retries.",
+                             resp.status_code, reason)
+                    raise LLMError(f"Server error {resp.status_code}: {err_msg}", resp.status_code, body)
                 wait = _retry_after(resp) or min(2 ** attempt, 20)
                 last_exc = LLMError(f"Server error {resp.status_code}: {err_msg}", resp.status_code, body)
                 log.warning("LLM %s (attempt %d), retrying in %.1fs", resp.status_code, attempt, wait)
@@ -253,3 +273,49 @@ def _retry_after(resp: requests.Response) -> Optional[float]:
         return min(float(val), 60.0)
     except ValueError:
         return None
+
+
+# gRPC-style status codes that mark the REQUEST as invalid, not the service as busy. Gateways
+# (Antigravity) surface these in 503 bodies; a retry of the same bytes fails identically.
+_NON_TRANSIENT_CODES = (
+    "invalid_argument", "failed_precondition", "not_found", "already_exists",
+    "out_of_range", "permission_denied", "unauthenticated", "unimplemented",
+)
+
+
+def _non_transient_reason(lowered_body: str) -> Optional[str]:
+    for code in _NON_TRANSIENT_CODES:
+        if code in lowered_body:
+            return code
+    if "user location is not supported" in lowered_body:
+        return "user-location-policy"
+    if "requests ending with a model turn" in lowered_body:
+        return "request-shape"
+    return None
+
+
+def _is_context_overflow(lowered_err: str) -> bool:
+    """True when the provider says the request is bigger than the model's context window."""
+    return any(marker in lowered_err for marker in (
+        "exceeds the available context size",   # Ollama: "request (6722 tokens) exceeds the available context size (4096 tokens)"
+        "context length exceeded",
+        "maximum context length",               # OpenAI: "This model's maximum context length is ..."
+        "context window",
+        "too many tokens",
+        "input is too long",
+        "prompt is too long",
+        "reduce the length",
+    ))
+
+
+def _context_overflow_message(err_msg: str) -> str:
+    return (f"The conversation is now too long for this model's context window ({err_msg[:300]}). "
+            "Start a new chat to continue, or switch to a model with a larger context window in Settings.")
+
+
+def _image_unsupported(lowered_err: str) -> bool:
+    """Deterministic 'this model cannot see images' errors (any HTTP status)."""
+    return ("mmproj" in lowered_err
+            or "image input is not supported" in lowered_err
+            or "does not support image" in lowered_err
+            or ("image" in lowered_err and "not supported" in lowered_err))

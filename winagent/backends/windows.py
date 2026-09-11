@@ -464,7 +464,9 @@ class WindowsBackend(DesktopBackend):
     # ------------------------------------------------------------------ mouse
     def mouse_position(self) -> tuple[int, int]:
         pt = wintypes.POINT()
-        if not self.user32.GetPhysicalCursorPos(ctypes.byref(pt)):
+        # POINTER(POINT) argtypes: pass the instance. byref() raises ArgumentError on Python 3.12+,
+        # which silently killed the mouse/active_window data in screenshot results (swallowed upstream).
+        if not self.user32.GetPhysicalCursorPos(pt):
             raise BackendError("GetPhysicalCursorPos failed; check the interactive desktop session.")
         return int(pt.x), int(pt.y)
 
@@ -765,7 +767,9 @@ class WindowsBackend(DesktopBackend):
             hr = self.dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rect), ctypes.sizeof(rect))
             if hr == 0 and (rect.right - rect.left) > 0:
                 return rect.left, rect.top, rect.right, rect.bottom
-        self.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        # argtypes declares POINTER(RECT): pass the instance (ctypes takes its address); byref() would
+        # raise ArgumentError ("expected LP__RECT instance instead of pointer to RECT").
+        self.user32.GetWindowRect(hwnd, rect)
         return rect.left, rect.top, rect.right, rect.bottom
 
     def _is_cloaked(self, hwnd: int) -> bool:
@@ -789,7 +793,8 @@ class WindowsBackend(DesktopBackend):
             try:
                 size = wintypes.DWORD(1024)
                 buf = ctypes.create_unicode_buffer(size.value)
-                if self.kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                # POINTER(DWORD) argtypes: pass the instance (ctypes takes its address), not byref().
+                if self.kernel32.QueryFullProcessImageNameW(h, 0, buf, size):
                     name = os.path.basename(buf.value)
             finally:
                 self.kernel32.CloseHandle(h)
@@ -932,7 +937,7 @@ class WindowsBackend(DesktopBackend):
             cls = self._class_name(child)
             text = self._window_text(child)
             rect = wintypes.RECT()
-            self.user32.GetWindowRect(child, ctypes.byref(rect))
+            self.user32.GetWindowRect(child, rect)  # POINTER(RECT) argtypes: pass the instance, not byref()
             if rect.right - rect.left <= 0 or rect.bottom - rect.top <= 0:
                 return True
             controls.append(ControlInfo(int(child), cls, text[:200], rect.left, rect.top, rect.right, rect.bottom,
@@ -1051,7 +1056,8 @@ class WindowsBackend(DesktopBackend):
             mi.fMask = MIIM_STRING | MIIM_STATE | MIIM_SUBMENU
             mi.dwTypeData = ctypes.cast(buf, wintypes.LPWSTR)
             mi.cch = 259
-            if not u.GetMenuItemInfoW(hmenu, i, True, ctypes.byref(mi)):
+            # POINTER(MENUITEMINFO) argtypes: pass the instance, not byref() (ArgumentError on 3.12+).
+            if not u.GetMenuItemInfoW(hmenu, i, True, mi):
                 continue
             if mi.fType & MF_SEPARATOR:
                 items.append({"separator": True})
