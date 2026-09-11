@@ -229,3 +229,74 @@ def test_conversation_persists_between_runs(config, backend):
     assert any(m["role"] == "assistant" and json.loads(m["content"])["message"] == "first answer" for m in msgs)
     agent.reset()
     assert agent.history == []
+
+
+# ---------------------------------------------------------------------------
+# Completion verification (verify_on_completion): before accepting a successful
+# task_complete of real tool work, the model gets ONE round to check the result.
+# ---------------------------------------------------------------------------
+def _completion(script_extra):
+    return (native_tool_message(("open_app", {"name": "notepad", "wait": 0})),
+            native_tool_message(("task_complete", {"summary": "Notepad opened.", "success": True})),
+            *script_extra)
+
+
+def test_successful_completion_is_verified_once(config, backend):
+    config.verify_on_completion = True
+    llm = ScriptedLLM(_completion([
+        native_tool_message(("task_complete", {"summary": "Verified on the screenshot: Notepad is open.", "success": True})),
+    ]))
+    statuses = []
+    agent = make_agent(config, backend, llm, on_status=statuses.append)
+    outcome = agent.run("open notepad")
+    assert outcome.status == "completed"
+    assert outcome.message == "Verified on the screenshot: Notepad is open."
+    assert len(llm.calls) == 3                      # action, task_complete, verification re-confirm
+    verify_msg = [m for m in llm.calls[2]["messages"] if "Completion check" in str(m.get("content"))]
+    assert verify_msg and verify_msg[0]["role"] == "user"
+    assert any("Verifying" in s for s in statuses)
+
+
+def test_verification_catches_incomplete_work(config, backend):
+    config.verify_on_completion = True
+    llm = ScriptedLLM(_completion([
+        # verification: the model sees the work is NOT done and keeps working
+        native_tool_message(("type_text", {"text": "hello"})),
+        native_tool_message(("task_complete", {"summary": "Done for real.", "success": True})),
+    ]))
+    agent = make_agent(config, backend, llm)
+    outcome = agent.run("open notepad and type hello")
+    assert outcome.status == "completed"
+    assert outcome.message == "Done for real."
+    assert len(llm.calls) == 4                       # no SECOND verification round
+    assert "hello" in "".join(backend.typed)         # the continued work actually ran
+
+
+def test_verification_skipped_for_honest_failure(config, backend):
+    config.verify_on_completion = True
+    llm = ScriptedLLM([
+        native_tool_message(("open_app", {"name": "notepad", "wait": 0})),
+        native_tool_message(("task_complete", {"summary": "Could not open the file.", "success": False})),
+    ])
+    agent = make_agent(config, backend, llm)
+    outcome = agent.run("open the file")
+    assert outcome.status == "answered"
+    assert len(llm.calls) == 2
+
+
+def test_verification_skipped_without_tools(config, backend):
+    config.verify_on_completion = True
+    llm = ScriptedLLM([json.dumps({"message": "That is 42."})])
+    agent = make_agent(config, backend, llm)
+    outcome = agent.run("answer: what is the meaning of life?")
+    assert outcome.status == "answered"
+    assert len(llm.calls) == 1
+
+
+def test_verification_disabled_in_config(config, backend):
+    config.verify_on_completion = False
+    llm = ScriptedLLM(_completion([]))
+    agent = make_agent(config, backend, llm)
+    outcome = agent.run("open notepad")
+    assert outcome.status == "completed"
+    assert len(llm.calls) == 2

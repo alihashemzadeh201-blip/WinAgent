@@ -152,6 +152,24 @@ class SettingsDialog(QDialog):
         aform.addRow("", self.vision_enabled)
         self.auto_screenshot = QCheckBox("Automatically capture the screen after each action")
         aform.addRow("", self.auto_screenshot)
+        self.verify_completion = QCheckBox("Verify the result before accepting task completion")
+        self.verify_completion.setToolTip(
+            "Before accepting a successful completion, the agent takes a fresh screenshot and asks the model "
+            "to check that the original request is really satisfied (one round: the model either confirms "
+            "with task_complete or continues the work). Honest failure reports are never re-verified.")
+        aform.addRow("", self.verify_completion)
+        try:
+            from ..skills import load_skills
+            installed = load_skills()
+        except Exception:
+            installed = []
+        skills_label = QLabel(", ".join(s.name for s in installed) if installed else "(none installed)")
+        skills_label.setToolTip(
+            ("\n".join(f"{s.name} → {s.path}" for s in installed) or
+             "Install a skill by dropping a .md / .txt procedure file into the 'skills' folder next to WinAgent "
+             "(or %APPDATA%\\WinAgent\\skills on Windows). Files starting with '_' are ignored "
+             "(see skills/_example.md)."))
+        aform.addRow("Installed skills", skills_label)
         self.action_delay = QDoubleSpinBox()
         self.action_delay.setRange(0.0, 10.0)
         self.action_delay.setSingleStep(0.1)
@@ -326,6 +344,7 @@ class SettingsDialog(QDialog):
         self.response_retries.setValue(cfg.max_response_retries)
         self.vision_enabled.setChecked(cfg.vision_enabled)
         self.auto_screenshot.setChecked(cfg.auto_screenshot_after_action)
+        self.verify_completion.setChecked(cfg.verify_on_completion)
         self.action_delay.setValue(cfg.action_delay)
         self.max_images.setValue(cfg.max_images_in_context)
         self.preferred_layout.setEditText(cfg.preferred_keyboard_layout or "en-US")
@@ -393,6 +412,7 @@ class SettingsDialog(QDialog):
         cfg.max_response_retries = int(self.response_retries.value())
         cfg.vision_enabled = self.vision_enabled.isChecked()
         cfg.auto_screenshot_after_action = self.auto_screenshot.isChecked()
+        cfg.verify_on_completion = self.verify_completion.isChecked()
         cfg.action_delay = float(self.action_delay.value())
         cfg.max_images_in_context = int(self.max_images.value())
         cfg.preferred_keyboard_layout = (self.preferred_layout.currentText() or "en-US").strip()

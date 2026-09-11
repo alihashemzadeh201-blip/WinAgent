@@ -165,7 +165,7 @@ def test_native_schemas_and_json_docs_are_consistent_without_mutating_registry()
 
 @pytest.mark.parametrize("protocol", ["native", "json"])
 def test_mode_is_pinned_for_batch_and_changes_only_with_the_next_observed_frame(monkeypatch, protocol):
-    cfg = Config(coordinate_space=NORM, tool_protocol=protocol, action_delay=0)
+    cfg = Config(coordinate_space=NORM, tool_protocol=protocol, action_delay=0, verify_on_completion=False)
     backend = FakeBackend(width=1920, height=1080)
     move = backend.mouse_move
     def change_mode(*args, **kwargs):
@@ -193,7 +193,7 @@ def test_mode_is_pinned_for_batch_and_changes_only_with_the_next_observed_frame(
 
 
 def test_retry_keeps_the_requested_coordinate_contract_even_if_settings_change():
-    cfg = Config(coordinate_space=NORM, action_delay=0)
+    cfg = Config(coordinate_space=NORM, action_delay=0, verify_on_completion=False)
     backend = FakeBackend(width=1920, height=1080)
     def broken(messages):
         cfg.coordinate_space = PIXELS
@@ -206,7 +206,7 @@ def test_retry_keeps_the_requested_coordinate_contract_even_if_settings_change()
 
 
 def test_normalized_without_a_frame_fails_closed_then_requests_a_full_image():
-    cfg = Config(coordinate_space=NORM, action_delay=0)
+    cfg = Config(coordinate_space=NORM, action_delay=0, verify_on_completion=False)
     backend = FakeBackend(width=1920, height=1080)
     executor = ToolExecutor(backend, cfg)
     result = executor.execute(ToolCall("click", {"x": 500, "y": 500}))

@@ -84,6 +84,7 @@ class Config:
     vision_enabled: bool = True          # send screenshots as images
     auto_screenshot_after_action: bool = True
     action_delay: float = 0.6            # seconds to wait after UI actions before screenshot
+    verify_on_completion: bool = True    # before accepting a successful task_complete, ask the model to verify the result once
     max_images_in_context: int = 3       # older screenshots are dropped from context
     max_history_messages: int = 80
     confirm_dangerous_actions: bool = True

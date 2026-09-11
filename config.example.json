@@ -13,6 +13,7 @@
   "max_response_retries": 3,
   "vision_enabled": true,
   "auto_screenshot_after_action": true,
+  "verify_on_completion": true,
   "action_delay": 0.6,
   "max_images_in_context": 3,
   "max_history_messages": 80,

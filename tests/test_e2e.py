@@ -19,6 +19,9 @@ def server(request):
 
 
 def make(url: str, **overrides):
+    # verify_on_completion off: these tests assert an exact HTTP call sequence against a fixed
+    # mock-server script, and the completion-verification round is covered by tests/test_agent.py.
+    overrides.setdefault("verify_on_completion", False)
     cfg = Config(api_base_url=url, api_key="test-key", model="mock-vision", action_delay=0.0, screenshot_max_width=640, **overrides)
     backend = FakeBackend()
     return cfg, backend

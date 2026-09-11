@@ -42,6 +42,7 @@ from .protocol import (
 )
 from .screenshot import Screenshot
 from .screenguard import ScreenGuard
+from .skills import Skill, load_skills, skills_section
 from .tools import ToolExecutor, ToolResult
 from .tools.definitions import openai_tool_schemas
 
@@ -108,6 +109,14 @@ class Agent:
         self._task_records: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self.running = False
+        # Installed skills (user-provided procedure documents) are loaded once and rendered into
+        # the system prompt of every request. A broken/missing skills dir must never break a run.
+        try:
+            self.skills: list[Skill] = load_skills()
+        except Exception:
+            log.exception("skill loading failed; continuing without skills")
+            self.skills = []
+        self._skills_section = skills_section(self.skills)
 
     # --------------------------------------------------------------- control
     def _initial_protocol(self) -> str:
@@ -161,7 +170,8 @@ class Agent:
         info["auto_fix_keyboard_layout"] = self.config.auto_fix_keyboard_layout
         prompt = build_system_prompt(protocol=self.protocol, vision=self.vision, system_info=info,
                                      language=self.config.response_language, extra=self.config.extra_system_prompt,
-                                     coordinate_space=coordinate_space or self.config.coordinate_space)
+                                     coordinate_space=coordinate_space or self.config.coordinate_space,
+                                     skills=self._skills_section)
         return {"role": "system", "content": prompt}
 
     def _messages(self, coordinate_space: Optional[str] = None) -> list[dict[str, Any]]:
@@ -257,6 +267,7 @@ class Agent:
         self._has_progress_note = False
         self._task_records = []
         self._reset_stall()
+        self._verified_this_task = False   # completion verification is offered ONCE per task
         self._image_slots = [i for i, msg in enumerate(self.history) if _has_image(msg)]
         self._resync_image_frames()
         # No image from a previous request is a current coordinate frame. A failed/disabled
@@ -378,8 +389,17 @@ class Agent:
 
                 if finished is not None:
                     summary = finished.data.get("summary", "Done.")
+                    success = bool(finished.data.get("success", True))
+                    # Self-check: before accepting a SUCCESSFUL completion of real tool work, the
+                    # model gets ONE round to verify the result against a fresh screenshot (it may
+                    # confirm with task_complete again or continue working). An honest
+                    # success=false report is never re-verified – it is the truthful outcome.
+                    if self.config.verify_on_completion and success and n_calls > 0 and not self._verified_this_task:
+                        self._verified_this_task = True
+                        self._append_verification_prompt(summary)
+                        continue
                     self.events.on_assistant_text(summary)
-                    outcome = RunOutcome("completed" if finished.data.get("success", True) else "answered", summary)
+                    outcome = RunOutcome("completed" if success else "answered", summary)
                     break
                 if self.stop_event.is_set():
                     outcome = RunOutcome("stopped", "Stopped by user.")
@@ -517,6 +537,36 @@ class Agent:
                 "rest of the task. Finish with task_complete and an honest summary (success=false if "
                 "the goal was not reached), or use ask_user if the user must intervene.]")})
             self.events.on_status("Repeated action without visible change – asking the model to change approach.")
+
+    def _append_verification_prompt(self, summary: str) -> None:
+        """Ask the model to verify a claimed completion before it is accepted (once per task).
+
+        A fresh full screenshot is attached. The model either confirms with task_complete (which is
+        then accepted without another verification round) or continues working; the step budget
+        bounds the whole thing, so verification can never loop.
+        """
+        self.events.on_status("Verifying the result before accepting completion…")
+        shot: Optional[Screenshot] = None
+        if self.vision:
+            try:
+                shot = self.executor.take_screenshot()
+                self.events.on_screenshot(shot)
+            except Exception as exc:  # verification must not kill an otherwise-finished task
+                log.warning("verification screenshot failed: %s", exc)
+        text = (
+            "[Completion check – the agent just reported this task as done: "
+            f"“{summary[:400]}”. Before accepting it, VERIFY that the user's original request is "
+            "actually satisfied: compare the CURRENT screen (new screenshot attached) and the tool "
+            "results above against the request. "
+            "If anything is missing or wrong, do NOT accept it – continue with the next action(s) to "
+            "finish the job properly. "
+            "If it is genuinely satisfied, confirm by calling task_complete again with the same "
+            "truthful summary. Do not repeat actions that already succeeded.]"
+        )
+        if shot is not None:
+            text += f"\n\n[Verification screenshot. {shot.describe()}]"
+        msg, has_image = self._user_message(text, shot)
+        self._append(msg, has_image=has_image)
 
     def _call_model(self, *, coordinate_space: Optional[str] = None, task_in_progress: bool = False) -> AssistantTurn:
         """Negotiate capabilities and recover bad output BEFORE committing any tool calls to history.

@@ -245,7 +245,7 @@ def environment_section(system_info: dict[str, Any]) -> str:
 
 
 def build_system_prompt(*, protocol: str, vision: bool, system_info: dict[str, Any], language: str = "auto",
-                        extra: str = "", coordinate_space: str = "image_pixels") -> str:
+                        extra: str = "", coordinate_space: str = "image_pixels", skills: str = "") -> str:
     if coordinate_space not in COORDINATE_SPACES:
         raise ValueError(f"Unknown coordinate space: {coordinate_space}")
     if coordinate_space == "normalized_1000":
@@ -262,6 +262,8 @@ def build_system_prompt(*, protocol: str, vision: bool, system_info: dict[str, A
                       "received before this response. Do NOT return normalized 0-1000 units, percentages or "
                       "Windows logical pixels. The image dimensions are in its description.\n")
     parts = [BASE_PROMPT, convention]
+    if skills.strip():
+        parts.append(skills.strip() + "\n")
     if protocol == "json":
         parts.append(JSON_PROTOCOL_PROMPT + tools_markdown(coordinate_space) + "\n")
     else:

@@ -14,8 +14,10 @@ from winagent.config import Config  # noqa: E402
 
 @pytest.fixture
 def config() -> Config:
+    # verify_on_completion is OFF in the shared fixture so scripted-LLM tests keep their exact call
+    # counts; tests that exercise the completion verification set it to True explicitly.
     return Config(api_base_url="http://fake.local/v1", api_key="k", model="fake-model", action_delay=0.0,
-                  screenshot_max_width=800, confirm_dangerous_actions=True)
+                  screenshot_max_width=800, confirm_dangerous_actions=True, verify_on_completion=False)
 
 
 @pytest.fixture
