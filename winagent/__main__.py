@@ -9,25 +9,17 @@
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
 from pathlib import Path
 
 from . import __app_name__, __version__
-from .config import Config, default_config_dir, load_config, save_config
+from .config import Config, load_config, save_config
 
 
-def _setup_logging(level: str, log_dir: Path) -> None:
-    log_dir.mkdir(parents=True, exist_ok=True)
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
-    try:
-        handlers.append(logging.FileHandler(log_dir / "winagent.log", encoding="utf-8"))
-    except OSError:
-        pass
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO),
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s", handlers=handlers)
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("PIL").setLevel(logging.WARNING)
+def _setup_logging(level: str) -> None:
+    """Shared rotating-file + console logging (also used by the GUI)."""
+    from .logging_setup import setup_logging
+    setup_logging(level, console=True)
 
 
 def _cli_loop(config: Config, backend_kind: str, task: str | None, max_turns: int | None = None) -> int:
@@ -136,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
         config.model = args.model
     if args.log_level:
         config.log_level = args.log_level
-    _setup_logging(config.log_level, default_config_dir() / "logs")
+    _setup_logging(config.log_level)
 
     backend_kind = args.backend or ("fake" if args.demo else config.backend)
     config_path = Path(args.config) if args.config else None

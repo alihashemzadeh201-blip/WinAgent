@@ -93,6 +93,9 @@ class MainWindow(QMainWindow):
         self._task_started = 0.0
         self._last_shot: Optional[Screenshot] = None
         self._screenshots_dir = default_config_dir() / "screenshots"
+        # Rotating file log for the GUI process (console stays clean; the app has its own status UI).
+        from ..logging_setup import setup_logging
+        setup_logging(config.log_level, console=False)
         self.bridge = _Bridge()
         self._connect_bridge()
         self.setWindowTitle(f"{__app_name__} v{__version__}")
@@ -609,6 +612,9 @@ class MainWindow(QMainWindow):
         self.token_label.setText(f"tokens: {usage.get('prompt_tokens', 0)} in / {usage.get('completion_tokens', 0)} out")
         if outcome.status == "max_steps":
             self.chat.add("system", outcome.message)
+        if outcome.trace_file and outcome.status in ("error", "max_steps"):
+            self.chat.add("system",
+                          f"این جلسه یک لاگ کامل از ریکوست/ریسپانس مدل دارد (برای ارسال به پشتیبانی): {outcome.trace_file}")
         self._leave_working_mode()
         self._refresh_info()
 
@@ -749,7 +755,8 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Settings saved to {path}")
         except OSError as exc:
             QMessageBox.warning(self, "Settings", f"Could not save settings: {exc}")
-        logging.getLogger().setLevel(self.config.log_level)
+        from ..logging_setup import setup_logging
+        setup_logging(self.config.log_level, console=False)   # idempotent; also (re)creates the file handler
         self.overlay.configure(self.config.overlay_corner, self.config.overlay_exclude_from_capture)
         if backend_changed:
             self._init_backend()

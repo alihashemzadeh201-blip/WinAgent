@@ -17,11 +17,13 @@ import logging
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional
 
+from . import __version__ as APP_VERSION
 from .backends.base import DesktopBackend, EmergencyStop
 from .config import Config
+from .logging_setup import LLMTraceWriter, logs_dir, redact, sanitize_messages
 from .history import progress_message, request_summary, result_record
 from .llm import LLMCancelled, LLMClient, LLMError, LLMResponseError
 from .prompts import TASK_IN_PROGRESS_PROMPT, build_system_prompt
@@ -77,6 +79,7 @@ class RunOutcome:
     tool_calls: int = 0
     duration: float = 0.0
     usage: dict[str, int] = field(default_factory=dict)
+    trace_file: Optional[str] = None   # per-task request/response JSONL, for sending to the developer
 
 
 class Agent:
@@ -109,6 +112,9 @@ class Agent:
         self._task_records: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self.running = False
+        # Per-task request/response trace (JSONL).  Created in _run when log_llm_trace is on.
+        self._trace: Optional[LLMTraceWriter] = None
+        self._trace_seq = 0
         # Installed skills (user-provided procedure documents) are loaded once and rendered into
         # the system prompt of every request. A broken/missing skills dir must never break a run.
         try:
@@ -151,6 +157,87 @@ class Agent:
     def followup_history(self) -> list[dict[str, Any]]:
         """Copy the conversation handoff, never old live tool calls, when starting/rebuilding a task."""
         return copy.deepcopy(self._followup_history if self._followup_history is not None else self.history)
+
+    # ------------------------------------------------------------ tracing
+    def _start_trace(self, task: str) -> None:
+        """Open the per-task JSONL trace.  A failure here must never break the run."""
+        if not self.config.log_llm_trace:
+            self._trace = None
+            return
+        try:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            slug = re.sub(r"[^a-z0-9]+", "-", task.lower()).strip("-")[:40] or "task"
+            path = logs_dir() / "sessions" / f"{stamp}-{slug}.jsonl"
+            self._trace = LLMTraceWriter(path, secrets=[self.config.api_key])
+            self._trace.record(type="session_start", task=task, app_version=APP_VERSION,
+                               model=self.config.model, protocol=self.protocol,
+                               coordinate_space=self.config.coordinate_space,
+                               backend=type(self.backend).__name__,
+                               config=redact(asdict(self.config), [self.config.api_key]),
+                               skills=[s.name for s in self.skills])
+        except Exception:
+            log.exception("could not start session trace; continuing without it")
+            self._trace = None
+
+    def _record_request(self, seq: int, retry: int, temperature: Optional[float],
+                        messages: list[dict[str, Any]], tools: Optional[list[dict[str, Any]]],
+                        response_json: bool) -> None:
+        if self._trace is None:
+            return
+        # The tool schema is identical on every call; log names after the first.
+        tool_field: Any = tools
+        if tools and seq > 1:
+            tool_field = [t.get("function", {}).get("name") for t in tools]
+        self._trace.record(type="llm_request", seq=seq, retry=retry, model=self.config.model,
+                           temperature=temperature, response_json=response_json,
+                           n_messages=len(messages), tools=tool_field,
+                           messages=sanitize_messages(messages))
+
+    def _record_response(self, seq: int, retry: int, resp: Any, ok: bool = True,
+                         error: str = "", error_status: Optional[int] = None,
+                         error_body: str = "") -> None:
+        if self._trace is None:
+            return
+        fields: dict[str, Any] = {"type": "llm_response", "seq": seq, "retry": retry, "ok": ok}
+        if ok:
+            fields.update(model=resp.model, finish_reason=resp.finish_reason,
+                          latency_ms=round(getattr(resp, "latency", 0.0) * 1000, 1),
+                          usage=resp.usage, message=resp.message, raw=resp.raw)
+        else:
+            fields.update(error=error, status=error_status,
+                          body=(error_body or "")[:4000])
+        self._trace.record(**fields)
+
+    def _record_rejection(self, seq: int, retry: int, reason: str) -> None:
+        """The transport succeeded but the response was unusable; keep the reason next to it."""
+        if self._trace is None:
+            return
+        self._trace.record(type="llm_rejected", seq=seq, retry=retry, reason=(reason or "")[:2000])
+
+    def _record_tool_results(self, seq: int, results: list) -> None:
+        if self._trace is None:
+            return
+        self._trace.record(type="tool_results", seq=seq,
+                           results=[{"tool": r.call.name, "args": r.call.arguments,
+                                     "ok": r.ok, "error": (r.error or "")[:1000],
+                                     "screenshot": bool(r.screenshot),
+                                     "task_complete": r.task_complete,
+                                     "duration_ms": round(getattr(r, "duration", 0.0) * 1000, 1)}
+                                    for r in results])
+
+    def _end_trace(self, outcome: "RunOutcome") -> None:
+        if self._trace is None:
+            return
+        try:
+            outcome.trace_file = str(self._trace.path)
+            self._trace.record(type="session_end", status=outcome.status,
+                               message=(outcome.message or "")[:2000],
+                               steps=outcome.steps, tool_calls=outcome.tool_calls,
+                               duration_s=round(outcome.duration, 2), usage=outcome.usage,
+                               error=(outcome.message or "") if outcome.status == "error" else "")
+        finally:
+            self._trace.close()
+            self._trace = None
 
     def _confirm(self, call: ToolCall, reason: str) -> bool:
         try:
@@ -275,6 +362,8 @@ class Agent:
         self._task_records = []
         self._reset_stall()
         self._verified_this_task = False   # completion verification is offered ONCE per task
+        self._trace_seq = 0
+        self._start_trace(task)
         self._image_slots = [i for i, msg in enumerate(self.history) if _has_image(msg)]
         self._resync_image_frames()
         # No image from a previous request is a current coordinate frame. A failed/disabled
@@ -429,6 +518,7 @@ class Agent:
         outcome.tool_calls = n_calls
         outcome.duration = time.time() - start
         outcome.usage = {"prompt_tokens": self.llm.total_prompt_tokens, "completion_tokens": self.llm.total_completion_tokens}
+        self._end_trace(outcome)
         # Close the assistant turn after terminal tool results and preserve a compact, factual
         # handoff for a follow-up. Do not execute anything, call the model, or pretend errors succeeded.
         closing = request_summary(outcome.message, outcome.status, self._task_records)
@@ -465,6 +555,7 @@ class Agent:
 
     def _append_results(self, results: list[ToolResult]) -> None:
         """Add tool results (and the newest screenshot) to the history."""
+        self._record_tool_results(self._trace_seq, results)
         latest_shot: Optional[Screenshot] = None
         for r in results:
             record = result_record(r)
@@ -583,6 +674,8 @@ class Agent:
         Previously successful rounds are preserved and are never re-executed by this retry loop.
         """
         coordinate_space = coordinate_space or self.config.coordinate_space
+        self._trace_seq += 1
+        seq = self._trace_seq
         retries = 0
         repair_reason = ""
         last_content = ""          # raw text of the most recently rejected response
@@ -603,10 +696,17 @@ class Agent:
             # loop can escape the identical-output attractor (capped at 1.5).
             retry_temperature = None if retries == 0 else min(self.config.temperature + 0.25 * retries, 1.5)
             try:
-                if self.protocol == "native":
-                    resp = self.llm.chat(messages, tools=openai_tool_schemas(coordinate_space), temperature=retry_temperature)
-                else:
-                    resp = self.llm.chat(messages, temperature=retry_temperature)
+                tools = openai_tool_schemas(coordinate_space) if self.protocol == "native" else None
+                self._record_request(seq, retries, retry_temperature, messages, tools, response_json=False)
+                try:
+                    resp = self.llm.chat(messages, tools=tools, temperature=retry_temperature)
+                except LLMError as exc:
+                    self._record_response(seq, retries, None, ok=False,
+                                           error=f"{type(exc).__name__}: {exc}",
+                                           error_status=getattr(exc, "status", None),
+                                           error_body=getattr(exc, "body", "") or "")
+                    raise
+                self._record_response(seq, retries, resp)
                 if self.stop_event.is_set():
                     raise LLMCancelled("stopped")
                 log.info("Model response: requested=%s reported=%s coordinate_space=%s finish=%s",
@@ -642,6 +742,7 @@ class Agent:
             except (LLMResponseError, ProtocolError) as exc:
                 if self.stop_event.is_set():
                     raise LLMCancelled("stopped") from exc
+                self._record_rejection(seq, retries, str(exc))
                 if retries >= self.config.max_response_retries:
                     # A JSON-protocol model that keeps answering in prose (or with a {"message": ...}
                     # envelope) while work is in progress will never learn the action format. The

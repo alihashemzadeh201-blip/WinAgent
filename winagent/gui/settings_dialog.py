@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import threading
 from typing import Optional
 
@@ -309,6 +312,29 @@ class SettingsDialog(QDialog):
         self.log_level = QComboBox()
         self.log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
         fform.addRow("Log level", self.log_level)
+        self.log_llm_trace = QCheckBox("Record a per-task model request/response trace (JSONL)")
+        self.log_llm_trace.setToolTip(
+            "Writes one .jsonl file per task into the log folder's sessions/ subfolder. "
+            "These files contain the full conversation with the model (screenshots redacted) and are "
+            "exactly what the developer needs to debug a misbehaving run.")
+        fform.addRow("", self.log_llm_trace)
+        from ..logging_setup import logs_dir
+        self.logs_folder = QLabel(str(logs_dir()))
+        self.logs_folder.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.logs_folder.setToolTip("All logs (winagent.log + per-task session traces) live here.")
+        fform.addRow("Log folder", self.logs_folder)
+        log_btns = QHBoxLayout()
+        self.btn_open_logs = QPushButton("Open folder")
+        self.btn_open_logs.clicked.connect(self._open_log_folder)
+        self.btn_export_bundle = QPushButton("Export log bundle…")
+        self.btn_export_bundle.setToolTip(
+            "Zips the application log + the most recent task traces into one file to send "
+            "to the developer when reporting a problem.")
+        self.btn_export_bundle.clicked.connect(self._export_log_bundle)
+        log_btns.addWidget(self.btn_open_logs)
+        log_btns.addWidget(self.btn_export_bundle)
+        log_btns.addStretch(1)
+        fform.addRow("", log_btns)
         note = QLabel("Changing the hotkey or the backend takes effect after saving.")
         note.setWordWrap(True)
         note.setObjectName("Muted")
@@ -375,6 +401,7 @@ class SettingsDialog(QDialog):
         self.mouse_failsafe.setChecked(cfg.mouse_failsafe)
         self.backend.setCurrentText(cfg.backend)
         self.log_level.setCurrentText(cfg.log_level)
+        self.log_llm_trace.setChecked(cfg.log_llm_trace)
 
     def _refresh_skills_label(self) -> None:
         try:
@@ -462,6 +489,7 @@ class SettingsDialog(QDialog):
         cfg.mouse_failsafe = self.mouse_failsafe.isChecked()
         cfg.backend = self.backend.currentText()
         cfg.log_level = self.log_level.currentText()
+        cfg.log_llm_trace = self.log_llm_trace.isChecked()
         try:
             from ..keys import hotkey_to_vk
 
@@ -474,6 +502,34 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "Invalid settings", "\n".join(problems))
             return None
         return cfg
+
+    # ------------------------------------------------------------- log tools
+    def _open_log_folder(self) -> None:
+        """Open the log folder in the platform file manager."""
+        from ..logging_setup import logs_dir
+        path = logs_dir()
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as exc:
+            QMessageBox.warning(self, "Settings", f"Could not open the log folder:\n{exc}")
+
+    def _export_log_bundle(self) -> None:
+        """Zip the app log + recent task traces into a single sendable file."""
+        from ..logbundle import make_log_bundle
+        try:
+            bundle = make_log_bundle(config=self.config)
+        except Exception as exc:
+            QMessageBox.warning(self, "Settings", f"Could not create the log bundle:\n{exc}")
+            return
+        QMessageBox.information(self, "Log bundle ready",
+                                f"A log bundle was created:\n\n{bundle}\n\n"
+                                "Send this single file to the developer together with a short "
+                                "description of what went wrong.")
 
     def _accept(self) -> None:
         cfg = self._collect()

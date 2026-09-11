@@ -115,6 +115,7 @@ class Config:
     overlay_corner: str = "bottom-right"      # where the status overlay appears (it can also be dragged)
     overlay_exclude_from_capture: bool = True  # Windows 10 2004+: keep the overlay out of ALL screen captures
     log_level: str = "INFO"
+    log_llm_trace: bool = True           # record every model request/response per task (logs/sessions/*.jsonl)
 
     # ------------------------------------------------------------------------
     def chat_completions_url(self) -> str:
