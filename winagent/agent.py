@@ -168,6 +168,13 @@ class Agent:
         # Surface the agent's own layout policy to the model alongside the machine facts.
         info["preferred_keyboard_layout"] = self.config.preferred_keyboard_layout
         info["auto_fix_keyboard_layout"] = self.config.auto_fix_keyboard_layout
+        # Skills can be installed/edited at any time (e.g. from the settings UI); the section is
+        # rebuilt per request so a freshly saved skill takes effect without rebuilding the agent.
+        try:
+            self.skills = load_skills()
+            self._skills_section = skills_section(self.skills)
+        except Exception:  # pragma: no cover - a broken skills dir must not break a run
+            log.exception("skill loading failed; keeping the previous skills section")
         prompt = build_system_prompt(protocol=self.protocol, vision=self.vision, system_info=info,
                                      language=self.config.response_language, extra=self.config.extra_system_prompt,
                                      coordinate_space=coordinate_space or self.config.coordinate_space,
@@ -587,9 +594,19 @@ class Agent:
             if task_in_progress:
                 messages[0]["content"] += "\n" + TASK_IN_PROGRESS_PROMPT
             if repair_reason:
-                messages.append({"role": "user", "content": self._response_repair_prompt(repair_reason, task_in_progress=task_in_progress)})
+                # `retries` is 1 on the first repair, so attempt==1 keeps the original message and
+                # escalation starts on the SECOND retry (the model needs a different nudge, not a repeat).
+                messages.append({"role": "user", "content": self._response_repair_prompt(
+                    repair_reason, task_in_progress=task_in_progress, attempt=retries)})
+            # A low-temperature model that failed once will usually emit the SAME invalid output when
+            # asked again verbatim. Each retry therefore also raises the temperature slightly so the
+            # loop can escape the identical-output attractor (capped at 1.5).
+            retry_temperature = None if retries == 0 else min(self.config.temperature + 0.25 * retries, 1.5)
             try:
-                resp = self.llm.chat(messages, tools=openai_tool_schemas(coordinate_space)) if self.protocol == "native" else self.llm.chat(messages)
+                if self.protocol == "native":
+                    resp = self.llm.chat(messages, tools=openai_tool_schemas(coordinate_space), temperature=retry_temperature)
+                else:
+                    resp = self.llm.chat(messages, temperature=retry_temperature)
                 if self.stop_event.is_set():
                     raise LLMCancelled("stopped")
                 log.info("Model response: requested=%s reported=%s coordinate_space=%s finish=%s",
@@ -658,7 +675,7 @@ class Agent:
                     continue
                 raise
 
-    def _response_repair_prompt(self, reason: str, *, task_in_progress: bool = False) -> str:
+    def _response_repair_prompt(self, reason: str, *, task_in_progress: bool = False, attempt: int = 1) -> str:
         protocol = (
             'Return native tool_calls with complete JSON-object arguments for actions. '
             if self.protocol == "native" else
@@ -677,13 +694,28 @@ class Agent:
             'For a complete answer needing no tools, return ONE JSON content object {"message":"your full answer"}, '
             'not bare text. '
         )
+        # Escalation: repeating the same repair text to a deterministic model reproduces the same bad
+        # output. Later retries say more, and say it differently.
+        escalation = ""
+        if attempt >= 2:
+            escalation = ("Your previous attempt failed for the same reason. Keep the response MINIMAL: output the "
+                          "valid response and nothing else – no screen descriptions, no quotes of earlier text, "
+                          "no reasoning, no apologies. ")
+        if attempt >= 3:
+            if self.protocol == "json":
+                escalation += ('A valid actions response has EXACTLY this shape (example content): '
+                               '{"actions":[{"tool":"screenshot","args":{}}]}. '
+                               "Send that shape with your actual next action, or a task_complete action when done. ")
+            else:
+                escalation += ("Use ONLY tool_calls (empty text content). If you cannot continue with a tool, "
+                               "call the task_complete tool with a non-empty summary. ")
         return (f"Your previous response was invalid: {reason[:500]}\n"
                 "It was discarded; NO actions from that response were executed. Send a COMPLETE replacement, "
                 "not a continuation. Do not simply quote or wrap the broken fragment as an answer/summary. "
                 "Reconsider the CURRENT user request, not an earlier completed task, using the screenshot and tool results already provided; "
                 "do NOT repeat earlier successful actions. Do not echo screenshot metadata or return only reasoning. "
                 "Preserve any refusal or inability honestly. Keep the response concise and in the original user's language. "
-                + protocol + terminal)
+                + protocol + terminal + escalation)
 
     def _graceful_finish_turn(self, task_in_progress: bool, last_turn: Optional[AssistantTurn],
                               last_content: str) -> Optional[AssistantTurn]:

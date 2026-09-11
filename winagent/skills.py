@@ -22,6 +22,7 @@ Rules:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -31,6 +32,34 @@ log = logging.getLogger(__name__)
 SKILL_SUFFIXES = (".md", ".markdown", ".txt")
 MAX_SKILL_CHARS = 4000       # per skill file
 MAX_TOTAL_SKILL_CHARS = 16000  # combined size of the whole skills section body
+
+_SLUG_RE = re.compile(r"[^a-z0-9._-]+")
+
+
+def slugify_name(name: str) -> str:
+    """File-safe skill name (lowercase, [a-z0-9._-]); 'skill' when nothing usable remains."""
+    slug = _SLUG_RE.sub("-", (name or "").strip().lower()).strip("-.")
+    return slug or "skill"
+
+
+def save_skill(name: str, body: str, dest_dir: Path) -> Path:
+    """Write (or overwrite) a skill file in ``dest_dir`` and return its path.
+
+    The file always gets a .md suffix; names that would be IGNORED by the loader
+    (leading '_' or '.') are rejected so the GUI cannot silently create dead skills.
+    """
+    slug = slugify_name(name)
+    if slug.startswith(("_", ".")):
+        raise ValueError(f"Skill name '{slug}' must not start with '_' or '.' (such files are ignored).")
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    path = dest / f"{slug}.md"
+    text = (body or "").strip()
+    if not text:
+        raise ValueError("Skill content is empty.")
+    path.write_text(text + "\n", encoding="utf-8")
+    log.info("Saved skill %r to %s", slug, path)
+    return path
 
 
 @dataclass(frozen=True)

@@ -158,18 +158,18 @@ class SettingsDialog(QDialog):
             "to check that the original request is really satisfied (one round: the model either confirms "
             "with task_complete or continues the work). Honest failure reports are never re-verified.")
         aform.addRow("", self.verify_completion)
-        try:
-            from ..skills import load_skills
-            installed = load_skills()
-        except Exception:
-            installed = []
-        skills_label = QLabel(", ".join(s.name for s in installed) if installed else "(none installed)")
-        skills_label.setToolTip(
-            ("\n".join(f"{s.name} → {s.path}" for s in installed) or
-             "Install a skill by dropping a .md / .txt procedure file into the 'skills' folder next to WinAgent "
-             "(or %APPDATA%\\WinAgent\\skills on Windows). Files starting with '_' are ignored "
-             "(see skills/_example.md)."))
-        aform.addRow("Installed skills", skills_label)
+        self._skills_label = QLabel("(none installed)")
+        self._skills_label.setToolTip("")
+        self._refresh_skills_label()
+        install_btn = QPushButton("Install skill…")
+        install_btn.setToolTip("Create or edit a skill: a .md/.txt procedure file the agent loads automatically "
+                               "(skills/ next to WinAgent, or %APPDATA%\\WinAgent\\skills). New skills take effect "
+                               "from the next request, no restart needed.")
+        install_btn.clicked.connect(self._edit_skill)
+        skills_row = QHBoxLayout()
+        skills_row.addWidget(self._skills_label, 1)
+        skills_row.addWidget(install_btn)
+        aform.addRow("Installed skills", skills_row)
         self.action_delay = QDoubleSpinBox()
         self.action_delay.setRange(0.0, 10.0)
         self.action_delay.setSingleStep(0.1)
@@ -375,6 +375,28 @@ class SettingsDialog(QDialog):
         self.mouse_failsafe.setChecked(cfg.mouse_failsafe)
         self.backend.setCurrentText(cfg.backend)
         self.log_level.setCurrentText(cfg.log_level)
+
+    def _refresh_skills_label(self) -> None:
+        try:
+            from ..skills import load_skills
+            installed = load_skills()
+        except Exception:
+            installed = []
+        self._skills_label.setText(", ".join(s.name for s in installed) if installed else "(none installed)")
+        self._skills_label.setToolTip(
+            "\n".join(f"{s.name} → {s.path}" for s in installed)
+            or "No skills installed. Use 'Install skill…' or drop a .md/.txt file into the skills folder "
+               "(next to WinAgent, or %APPDATA%\\WinAgent\\skills). Files starting with '_' are ignored.")
+
+    def _edit_skill(self) -> None:
+        try:
+            from .skill_dialog import SkillDialog
+        except Exception as exc:  # pragma: no cover - Qt import issue
+            QMessageBox.warning(self, "Skills unavailable", f"Could not open the skill editor: {exc}")
+            return
+        dlg = SkillDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._refresh_skills_label()
 
     def _sync_coordinate_widgets(self) -> None:
         normalized = self.shot_space.currentData() == "normalized_1000"

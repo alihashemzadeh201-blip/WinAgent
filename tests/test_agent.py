@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from PIL import ImageDraw
 
 from tests.conftest import ScriptedLLM, native_tool_message
@@ -300,3 +301,41 @@ def test_verification_disabled_in_config(config, backend):
     outcome = agent.run("open notepad")
     assert outcome.status == "completed"
     assert len(llm.calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Repair escalation: repeating the identical repair text to a deterministic
+# model reproduces the same bad output. Later retries must say more (and the
+# temperature rises) so the loop can actually change the model's behaviour.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("protocol", ["native", "json"], ids=["native", "json"])
+def test_repair_prompt_escalates_and_temperature_rises(config, backend, protocol):
+    config.tool_protocol = protocol
+    config.max_response_retries = 3
+    llm = ScriptedLLM(["just some prose", "still prose", "more prose", "more prose again"])
+    errors = []
+    agent = make_agent(config, backend, llm, on_error=errors.append)
+    outcome = agent.run("do a task", initial_screenshot=False)
+    assert outcome.status == "error" and errors and "after 4 attempts" in errors[0]
+    assert len(llm.calls) == 4
+
+    def repair_text(call_idx):
+        return [m["content"] for m in llm.calls[call_idx]["messages"]
+                if isinstance(m.get("content"), str) and "previous response was invalid" in m["content"]][0]
+
+    # call 0: first attempt, no repair, config temperature
+    assert llm.calls[0]["temperature"] is None
+    # every retry raises the temperature so a deterministic model can escape the bad-output loop
+    assert llm.calls[1]["temperature"] == pytest.approx(config.temperature + 0.25)
+    assert llm.calls[2]["temperature"] == pytest.approx(config.temperature + 0.5)
+    assert llm.calls[3]["temperature"] == pytest.approx(config.temperature + 0.75)
+    r1, r2, r3 = repair_text(1), repair_text(2), repair_text(3)
+    # retry 1: the original message (backward compatible); retry 2: minimal-output nudge;
+    # retry 3+: plus a concrete example of the valid shape for the active protocol
+    assert "Keep the response MINIMAL" not in r1
+    assert "Keep the response MINIMAL" in r2 and "Keep the response MINIMAL" in r3
+    if protocol == "json":
+        assert "EXACTLY this shape" not in r2 and "EXACTLY this shape" in r3
+        assert '"actions":[{"tool":"screenshot"' in r3
+    else:
+        assert "Use ONLY tool_calls" not in r2 and "Use ONLY tool_calls" in r3
